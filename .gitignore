@@ -1,5 +1,6 @@
 .nfs*
 sa1b
+exp
 
 # compilation and distribution
 __pycache__
