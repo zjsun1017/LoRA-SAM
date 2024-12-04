@@ -7,6 +7,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 
 from pycocotools import mask as mask_utils
+import joblib
 
 import json
 import numpy as np
@@ -22,7 +23,63 @@ target_transforms = transforms.Compose([
     transforms.Resize((160, 256)),
 ])
 
-class SA1B_Dataset(torchvision.datasets.ImageFolder):
+def construct_input(batch):
+        image, target = batch # lists
+        def load_num_masks(target, NUM_MASK_PER_IMG):
+            num_masks = target.shape[0]
+            selected = []
+            if num_masks >= NUM_MASK_PER_IMG :
+                all_mask_index = np.arange(num_masks)
+                np.random.shuffle(all_mask_index)
+                select_mask_indices = all_mask_index[:NUM_MASK_PER_IMG]
+            else:
+                select_mask_indices = np.arange(num_masks)
+                for _ in range(NUM_MASK_PER_IMG-num_masks):
+                  select_mask_indices = np.append(select_mask_indices, select_mask_indices[-1])
+
+            # Select only 
+            for ind in select_mask_indices:
+                m = target[ind]
+                # decode masks from COCO RLE format
+                selected.append(m)
+
+            target = torch.stack(selected, dim=0)
+            return target
+
+        def get_bbox_from_target(target):
+            bbox = []
+            for mask in target:
+                mask_y, mask_x = torch.where(mask > 0)
+                x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
+                
+                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
+                w = (x2 - x1)
+                h = (y2 - y1)
+                delta_w = min(random.random() * 0.2 * w, 20)
+                delta_h = min(random.random() * 0.2 * h, 20)
+
+                x1, y1, x2, y2  = center_x - (w + delta_w) / 2, center_y - (h + delta_h) / 2, \
+                                    center_x + (w + delta_w) / 2, center_y + (h + delta_h) / 2
+                bbox.append(torch.tensor([x1, y1, x2, y2]))
+
+            bbox = torch.stack(bbox, dim=0)
+            return bbox
+        
+        image = torch.stack(image,dim=0)
+
+        new_target = [load_num_masks(tg,16) for tg in target]
+        new_target = torch.stack(new_target,dim=0)
+        
+        bbox = [get_bbox_from_target(tg) for tg in new_target]
+        bbox = torch.stack(bbox,dim=0)
+
+        assert bbox.shape[0] == image.shape[0]
+
+        return image, new_target, bbox
+
+from torch.utils.data import Dataset
+class SA1B_Dataset(Dataset):
     """A data loader for the SA-1B Dataset from "Segment Anything" (SAM)
     This class inherits from :class:`~torchvision.datasets.ImageFolder` so
     the same methods can be overridden to customize the dataset.
@@ -41,6 +98,10 @@ class SA1B_Dataset(torchvision.datasets.ImageFolder):
         imgs (list): List of (image path, class_index) tuples
 
     """
+    def __init__(self, path) -> None:
+        super().__init__()
+        self.data_dir = path
+        self.files = glob.glob(os.path.join(path,'*.pkl'))
 
     def __getitem__(self, index):
         """
@@ -49,26 +110,12 @@ class SA1B_Dataset(torchvision.datasets.ImageFolder):
         Returns:
             tuple: (sample, target) where target is class_index of the target class.
         """
-        path, _ = self.imgs[index] # discard automatic subfolder labels
-        image = self.loader(path)
-        masks = json.load(open(f'{path[:-3]}json'))['annotations'] # load json masks
-        target = []
+        image, target, bbox = joblib.load('%s/sa1b%07i.pkl' % (self.data_dir, index))
 
-        for m in masks:
-            # decode masks from COCO RLE format
-            target.append(mask_utils.decode(m['segmentation']))
-        target = np.stack(target, axis=-1)
-
-        if self.transform is not None:
-            image = self.transform(image)
-        if self.target_transform is not None:
-            target = self.target_transform(target)
-        target[target > 0] = 1 # convert to binary masks
-
-        return image, target
+        return image, target, bbox
 
     def __len__(self):
-        return len(self.imgs)
+        return len(self.files)
 
 
 input_reverse_transforms = transforms.Compose([
@@ -164,6 +211,7 @@ class MyFastSAM(pl.LightningModule):
     def mask_focal_loss(prediction, targets, alpha, gamma):
 
         pred_mask = torch.sigmoid(prediction)
+        # pred_mask = prediction
         fl_1 = -alpha * ( (1 - pred_mask[targets > .5]) ** gamma ) * \
             torch.log(pred_mask[targets > .5] + 1e-6)
         
@@ -174,7 +222,19 @@ class MyFastSAM(pl.LightningModule):
 
     @staticmethod
     def iou_token_loss(iou_prediction, prediction, targets):
-        pass
+        def calculateIoU(pred, gt):
+          intersect = (pred * gt).sum(dim=(-1, -2))
+          union = pred.sum(dim=(-1, -2)) + gt.sum(dim=(-1, -2)) - intersect
+          ious = intersect.div(union)
+          return ious
+        pred_mask = torch.sigmoid(prediction)
+        # pred_mask = prediction
+        pred_mask[pred_mask > 0.5] = 1
+        pred_mask[pred_mask < 0.5] = 0
+        
+        iou = calculateIoU(pred_mask, targets)
+        return iou
+
 
     def training_step(self, batch):
         self.lora_sam.train()
@@ -195,11 +255,13 @@ class MyFastSAM(pl.LightningModule):
         loss.backward()
 
         self.optimizer.step()
+
+        iou_loss = self.iou_token_loss(None, pred, target)
         # self.log('train_loss', loss.item(), prog_bar=True)
 
         # During training, we backprop only the minimum loss over the 3 output masks.
         # sam paper main text Section 3
-        return loss.item()
+        return loss.item(), torch.mean(iou_loss).item()
 
     def validation_step(self, batch, batch_idx):
         images, targets = batch
@@ -209,65 +271,14 @@ class MyFastSAM(pl.LightningModule):
         self.log('val_loss', loss, prog_bar=True)
 
     def construct_batched_input(self, batch):
-        image, target = batch # lists
+        image, target, bbox = batch # Tensor
         device = self.device
-
-        def load_num_masks(target, NUM_MASK_PER_IMG):
-            num_masks = target.shape[0]
-            selected = []
-            if num_masks >= NUM_MASK_PER_IMG :
-                all_mask_index = np.arange(num_masks)
-                np.random.shuffle(all_mask_index)
-                select_mask_indices = all_mask_index[:NUM_MASK_PER_IMG]
-            else:
-                select_mask_indices = np.arange(num_masks)
-                for _ in range(NUM_MASK_PER_IMG-num_masks):
-                  select_mask_indices = np.append(select_mask_indices, select_mask_indices[-1])
-
-            # Select only 
-            for ind in select_mask_indices:
-                m = target[ind]
-                # decode masks from COCO RLE format
-                selected.append(m)
-
-            target = torch.stack(selected, dim=0)
-            return target
-
-        def get_bbox_from_target(target):
-            bbox = []
-            for mask in target:
-                mask_y, mask_x = torch.where(mask > 0)
-                x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
-                
-                center_x = (x1 + x2) / 2
-                center_y = (y1 + y2) / 2
-                w = (x2 - x1)
-                h = (y2 - y1)
-                delta_w = min(random.random() * 0.2 * w, 20)
-                delta_h = min(random.random() * 0.2 * h, 20)
-
-                x1, y1, x2, y2  = center_x - (w + delta_w) / 2, center_y - (h + delta_h) / 2, \
-                                    center_x + (w + delta_w) / 2, center_y + (h + delta_h) / 2
-                bbox.append(torch.tensor([x1, y1, x2, y2]))
-
-            bbox = torch.stack(bbox, dim=0)
-            return bbox
-        
-        image = torch.stack(image,dim=0)
-
-        new_target = [load_num_masks(tg,16) for tg in target]
-        new_target = torch.stack(new_target,dim=0)
-        
-        bbox = [get_bbox_from_target(tg) for tg in new_target]
-        bbox = torch.stack(bbox,dim=0)
-
-        assert bbox.shape[0] == image.shape[0]
         
         batch_input = [{
             'image':image[j].to(device),
             'original_size':(160, 256),
             'boxes':bbox[j].to(device),
-            'target': new_target[j].to(device)
+            'target': target[j].to(device)
         } for j in range(image.shape[0])] 
 
         return batch_input
@@ -293,19 +304,17 @@ def downsample_inject(model):
     
     return downsampled_sam
     
+# def collate_fn(batches):
+#     batch_data = []
+#     targets = []
 
+#     for b in batches:
+#         image, target = b
+#         batch_data.append(image)
 
-def collate_fn(batches):
-    batch_data = []
-    targets = []
+#         targets.append(target)
 
-    for b in batches:
-        image, target = b
-        batch_data.append(image)
-
-        targets.append(target)
-
-    return batch_data, targets
+#     return batch_data, targets
 
 def print_params(model):
   model_parameters = filter(lambda p: True, model.parameters())
@@ -346,9 +355,9 @@ writer = SummaryWriter('%s/%s/%s' % (args.result_dir, args.log_dir, start_time))
 print('[tensorboard] %s/%s/%s' % (args.result_dir, args.log_dir, start_time))
 save_dir = '%s/%s/%s' % (args.result_dir, args.log_dir, start_time)
 
-path = './sa1b'
-SA1Bdataset = SA1B_Dataset(path, transform=input_transforms, target_transform=target_transforms)
-train_loader = DataLoader(SA1Bdataset,batch_size=16,shuffle=True,collate_fn=collate_fn)
+path = './train_data'
+SA1Bdataset = SA1B_Dataset(path)
+train_loader = DataLoader(SA1Bdataset,batch_size=16,shuffle=True)#,collate_fn=collate_fn)
 
 sam_downsampled = downsample_inject(sam)
 
@@ -362,10 +371,11 @@ if args.train:
     total_step = len(train_loader)
     for i in pbar:
         for iter, data in enumerate(train_loader):
-            loss = model.training_step(data)
-            if iter%1==0:
+            loss, iou = model.training_step(data)
+            if iter%5==0:
 
                 writer.add_scalar('train/loss',loss,global_step=i*total_step+iter)
+                writer.add_scalar('train/iou',iou,global_step=i*total_step+iter)
             #     writer.add_images('train/pred', pred, epoch*total_step+iter, dataformats='HWC')
             #     writer.add_images('train/gt', gt, epoch*total_step+iter, dataformats='HWC')
 
