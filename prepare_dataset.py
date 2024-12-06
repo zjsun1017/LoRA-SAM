@@ -67,9 +67,23 @@ def construct_input(image, target):
             bbox = torch.stack(bbox, dim=0)
             return bbox
 
+        def get_point_from_target(target):
+            points = []
+            for mask in target:
+                mask_y, mask_x = torch.where(mask > 0)
+                selection = random.randint(0, mask_y.shape[0],dtype=int)
+                points.append(torch.tensor([mask_x[selection], mask_y[selection]]))
+
+            points = torch.stack(points, dim=0)
+            return points
+
         new_target = load_num_masks(target,16)
         
         bbox = get_bbox_from_target(new_target)
+        point = get_point_from_target(new_target)
+
+        import pdb
+        pdb.set_trace()
 
         return image, new_target, bbox
 

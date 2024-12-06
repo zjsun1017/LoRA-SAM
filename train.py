@@ -48,7 +48,9 @@ def construct_input(batch):
 
         def get_bbox_from_target(target):
             bbox = []
+            # pdb.set_trace()
             for mask in target:
+                
                 mask_y, mask_x = torch.where(mask > 0)
                 x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
                 
@@ -150,7 +152,7 @@ class MyFastSAM(pl.LightningModule):
     def __init__(self, orig_sam: Sam, lora_rank: int, lora_scale: float):
         super().__init__()
         self.lora_sam = orig_sam
-        LoRA_injection(self.lora_sam,['linear','conv'], lora_rank, lora_scale)
+        LoRA_injection(self.lora_sam,['linear','conv','convT'], lora_rank, lora_scale)
         self.configure_optimizers()
         
 
@@ -202,8 +204,9 @@ class MyFastSAM(pl.LightningModule):
     def mask_dice_loss(prediction, targets):
 
         pred_mask = torch.sigmoid(prediction)
+        # targets = targets>0.5
         dice_loss = 2 * torch.sum(pred_mask * targets, dim=(-1, -2) ) / (torch.sum( pred_mask ** 2, dim=(-1, -2)) + torch.sum( targets ** 2, dim=(-1, -2) ) + 1e-5)
-        dice_loss = (1 - dice_loss)
+        dice_loss = (1.0 - dice_loss)
         dice_loss = torch.mean(dice_loss)
         return dice_loss
 
@@ -227,17 +230,18 @@ class MyFastSAM(pl.LightningModule):
           union = pred.sum(dim=(-1, -2)) + gt.sum(dim=(-1, -2)) - intersect
           ious = intersect.div(union)
           return ious
-        pred_mask = torch.sigmoid(prediction)
+
         # pred_mask = prediction
-        pred_mask[pred_mask > 0.5] = 1
-        pred_mask[pred_mask < 0.5] = 0
+        pred = prediction>0
         
-        iou = calculateIoU(pred_mask, targets)
+        iou = calculateIoU(pred, targets)
         return iou
 
 
     def training_step(self, batch):
         self.lora_sam.train()
+        images = batch[0]
+        bbox = batch[2]
         batched_input = self.construct_batched_input(batch)
         device = self.device
         # 1a. single point prompt training
@@ -251,17 +255,29 @@ class MyFastSAM(pl.LightningModule):
         pred = pred.squeeze(2)
         target = [batched_input[j]['target'] for j in range(len(batched_input))]
         target = torch.stack(target, dim=0)
-        loss = 0.01 * self.mask_dice_loss(pred, target) + self.mask_focal_loss(pred,target,0.25,2)
-        loss.backward()
 
+        # pdb.set_trace()
+        # loss = 0.1 * self.mask_dice_loss(pred, target) + self.mask_focal_loss(pred,target,0.25,2)
+        # loss.backward()
+        dl = self.mask_dice_loss(pred, target)
+        fl = self.mask_focal_loss(pred,target,0.25,2)
+        loss = fl + 0.1*dl
+        loss.backward()
         self.optimizer.step()
 
         iou_loss = self.iou_token_loss(None, pred, target)
+
+        batch_prediction = {
+            'images':images.cpu(),
+            'target':target.cpu(),
+            'bbox':bbox.cpu(),
+            'pred':pred.detach().cpu(),
+        }
         # self.log('train_loss', loss.item(), prog_bar=True)
 
         # During training, we backprop only the minimum loss over the 3 output masks.
         # sam paper main text Section 3
-        return loss.item(), torch.mean(iou_loss).item()
+        return fl.item(), dl.item(), torch.mean(iou_loss).item(), batch_prediction
 
     def validation_step(self, batch, batch_idx):
         images, targets = batch
@@ -274,6 +290,7 @@ class MyFastSAM(pl.LightningModule):
         image, target, bbox = batch # Tensor
         device = self.device
         
+        # pdb.set_trace()
         batch_input = [{
             'image':image[j].to(device),
             'original_size':(160, 256),
@@ -292,7 +309,7 @@ sam.to(device)
 import copy
 import torch.nn as nn
 def downsample_inject(model):
-    downsampled_sam = copy.deepcopy(sam)
+    downsampled_sam = copy.deepcopy(model)
     for param in downsampled_sam.parameters():
         param.requires_grad_(False)
 
@@ -301,6 +318,7 @@ def downsample_inject(model):
     downsampled_sam.image_encoder.img_size = 256
     downsampled_sam.prompt_encoder.factor = 4
     downsampled_sam.prompt_encoder.image_embedding_size = (16, 16)
+    downsampled_sam.prompt_encoder.input_image_size = (256,256)
     
     return downsampled_sam
     
@@ -317,12 +335,71 @@ def downsample_inject(model):
 #     return batch_data, targets
 
 def print_params(model):
-  model_parameters = filter(lambda p: True, model.parameters())
-  params = sum([np.prod(p.size()) for p in model_parameters])
-  print("total params: ", params)
-  model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-  params = sum([np.prod(p.size()) for p in model_parameters])
-  print("training params: ", params)
+    model_parameters = filter(lambda p: True, model.parameters())
+    params = sum([np.prod(p.size()) for p in model_parameters])
+    print("total params: ", params)
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    params = sum([np.prod(p.size()) for p in model_parameters])
+    print("training params: ", params)
+
+def visualize_batch(images, pred, target, bbox):
+    def show_mask(mask, ax, random_color=False):
+        if random_color:
+            color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+        else:
+            color = np.array([30/255, 144/255, 255/255, 0.6])
+        h, w = mask.shape[-2:]
+        mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+        ax.imshow(mask_image)
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+    import numpy as np
+
+    batch_size = images.shape[0]
+    fig, axes = plt.subplots(batch_size, 3, figsize=(15, 5 * batch_size))  # 3 columns: image+GT, image+pred, image+bbox
+
+    for i in range(batch_size):
+        # Plot image + ground truth
+        ax_gt = axes[i, 0] if batch_size > 1 else axes[0]
+        ax_gt.imshow(images[i].permute(1, 2, 0).cpu().numpy())  # Assuming images are [C, H, W]
+        ax_gt.set_title(f"Image + GT (Sample {i})")
+        for mask in target[i]:
+            show_mask(mask.cpu().numpy(), ax_gt)
+        # ax_gt.axis('off')
+
+        # Plot image + prediction
+        ax_pred = axes[i, 1] if batch_size > 1 else axes[1]
+        # ax_pred.imshow(images[i].permute(1, 2, 0).cpu().numpy())
+        ax_pred.set_title(f"Image + Pred (Sample {i})")
+        for mask in pred[i]:
+            show_mask(mask.cpu().numpy(), ax_pred)
+        # ax_pred.axis('off')
+
+        # Plot image + bounding boxes
+        ax_bbox = axes[i, 2] if batch_size > 1 else axes[2]
+        ax_bbox.imshow(images[i].permute(1, 2, 0).cpu().numpy())
+        ax_bbox.set_title(f"Image + BBox (Sample {i})")
+        for box in bbox[i]:
+            x1, y1, x2, y2 = box.cpu().numpy()
+            width, height = x2 - x1, y2 - y1
+            rect = patches.Rectangle((x1, y1), width, height, linewidth=2, edgecolor='green', facecolor='none')
+            ax_bbox.add_patch(rect)
+        # ax_bbox.axis('off')
+
+    plt.tight_layout()
+
+    # Convert the Matplotlib figure to a NumPy array
+    canvas = FigureCanvas(fig)
+    canvas.draw()
+    array = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
+    array = array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+
+    plt.close(fig)  # Close the figure to free memory
+    return array
+
+
+
 
 from tensorboardX import SummaryWriter
 import argparse
@@ -360,7 +437,7 @@ SA1Bdataset = SA1B_Dataset(path)
 train_loader = DataLoader(SA1Bdataset,batch_size=16,shuffle=True)#,collate_fn=collate_fn)
 
 sam_downsampled = downsample_inject(sam)
-
+# pdb.set_trace()
 
 model = MyFastSAM(sam_downsampled, 4, 1.0).to(device)
 print_params(model)
@@ -371,11 +448,14 @@ if args.train:
     total_step = len(train_loader)
     for i in pbar:
         for iter, data in enumerate(train_loader):
-            loss, iou = model.training_step(data)
-            if iter%5==0:
+            fl, dl, iou, batch = model.training_step(data)
+            if iter%100==0:
 
-                writer.add_scalar('train/loss',loss,global_step=i*total_step+iter)
+                writer.add_scalar('train/fl',fl,global_step=i*total_step+iter)
+                writer.add_scalar('train/dl',dl,global_step=i*total_step+iter)
                 writer.add_scalar('train/iou',iou,global_step=i*total_step+iter)
+                canvas = visualize_batch(batch['images'], batch['pred']>0, batch['target'], batch['bbox'])
+                writer.add_images('train/viz', canvas, i*total_step+iter, dataformats='HWC')
             #     writer.add_images('train/pred', pred, epoch*total_step+iter, dataformats='HWC')
             #     writer.add_images('train/gt', gt, epoch*total_step+iter, dataformats='HWC')
 

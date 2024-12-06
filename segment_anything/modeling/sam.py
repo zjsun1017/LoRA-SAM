@@ -94,7 +94,10 @@ class Sam(nn.Module):
                 to subsequent iterations of prediction.
         """
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
+        
         image_embeddings = self.image_encoder(input_images)
+        # import pdb
+        # pdb.set_trace()
 
         outputs = []
         for image_record, curr_embedding in zip(batched_input, image_embeddings):
@@ -152,6 +155,9 @@ class Sam(nn.Module):
           (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
             is given by original_size.
         """
+
+        import pdb 
+        # pdb.set_trace()
         masks = F.interpolate(
             masks,
             (self.image_encoder.img_size, self.image_encoder.img_size),
@@ -171,6 +177,8 @@ class Sam(nn.Module):
         h, w = x.shape[-2:]
         padh = self.image_encoder.img_size - h
         padw = self.image_encoder.img_size - w
+        # import pdb
+        # pdb.set_trace()
         x = F.pad(x, (0, padw, 0, padh))
         return x
     

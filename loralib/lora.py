@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 
@@ -57,10 +58,10 @@ class LoRAedconv(nn.Module):
         # Actual trainable parameters
         if rank > 0:
             self.lora_A = nn.Parameter(
-                self.conv.weight.new_zeros((rank * kernel_size, in_channels * kernel_size),dtype=torch.float32)
+                self.conv.weight.new_zeros((in_channels * kernel_size, rank * kernel_size ),dtype=torch.float32)
             )
             self.lora_B = nn.Parameter(
-              self.conv.weight.new_zeros((out_channels//self.conv.groups*kernel_size, rank * kernel_size),dtype=torch.float32)
+              self.conv.weight.new_zeros((rank * kernel_size, out_channels//self.conv.groups*kernel_size),dtype=torch.float32)
             )
             self.scaling = alpha / rank
             # Freezing the pre-trained weight matrix
@@ -76,7 +77,7 @@ class LoRAedconv(nn.Module):
     def forward(self, x):
         return self.conv._conv_forward(
             x, 
-            self.conv.weight + (self.lora_B @ self.lora_A).view(self.conv.weight.shape) * self.scaling,
+            self.conv.weight + (self.lora_A @ self.lora_B).view(self.conv.weight.shape) * self.scaling,
             self.conv.bias
         )
     
@@ -97,13 +98,16 @@ class LoRAedconvT(nn.Module):
         # Actual trainable parameters
         if rank > 0:
             self.lora_A = nn.Parameter(
-                self.conv.weight.new_zeros((rank * kernel_size, in_channels * kernel_size))
+                self.conv.weight.new_zeros((in_channels * kernel_size, rank * kernel_size ),dtype=torch.float32)
             )
             self.lora_B = nn.Parameter(
-              self.conv.weight.new_zeros((out_channels//self.conv.groups*kernel_size, rank * kernel_size))
+              self.conv.weight.new_zeros((rank * kernel_size, out_channels//self.conv.groups*kernel_size),dtype=torch.float32)
             )
             self.scaling = alpha / rank
             # Freezing the pre-trained weight matrix
+
+        import pdb
+        # pdb.set_trace()
         self.reset_parameters()
         self.merged = False
 
@@ -114,10 +118,26 @@ class LoRAedconvT(nn.Module):
             nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
-        return self.conv._conv_forward(
-            x, 
-            self.conv.weight + (self.lora_B @ self.lora_A).view(self.conv.weight.shape) * self.scaling,
-            self.conv.bias
+        num_spatial_dims = 2
+        output_padding = self.conv._output_padding(
+            x,
+            None,
+            self.conv.stride,  # type: ignore[arg-type]
+            self.conv.padding,  # type: ignore[arg-type]
+            self.conv.kernel_size,  # type: ignore[arg-type]
+            num_spatial_dims,
+            self.conv.dilation,  # type: ignore[arg-type]
+        )
+
+        return F.conv_transpose2d(
+            x,
+            self.conv.weight + (self.lora_A @ self.lora_B ).view(self.conv.weight.shape) * self.scaling,
+            self.conv.bias,
+            self.conv.stride,
+            self.conv.padding,
+            output_padding,
+            self.conv.groups,
+            self.conv.dilation,
         )
 
 
