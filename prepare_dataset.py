@@ -30,9 +30,11 @@ def construct_input(image, target):
             num_masks = target.shape[0]
             selected = []
             if num_masks >= NUM_MASK_PER_IMG :
-                all_mask_index = np.arange(num_masks)
-                np.random.shuffle(all_mask_index)
-                select_mask_indices = all_mask_index[:NUM_MASK_PER_IMG]
+                mask_size = torch.count_nonzero(target,dim=(-2,-1))
+                select_mask_indices = torch.argsort(mask_size,descending=True)[:NUM_MASK_PER_IMG].numpy()
+                # all_mask_index = np.arange(num_masks)
+                # np.random.shuffle(all_mask_index)
+                # select_mask_indices = all_mask_index[:NUM_MASK_PER_IMG]
             else:
                 select_mask_indices = np.arange(num_masks)
                 for _ in range(NUM_MASK_PER_IMG-num_masks):
@@ -71,7 +73,7 @@ def construct_input(image, target):
             points = []
             for mask in target:
                 mask_y, mask_x = torch.where(mask > 0)
-                selection = random.randint(0, mask_y.shape[0],dtype=int)
+                selection = random.randint(0, mask_y.shape[0]-1)
                 points.append(torch.tensor([mask_x[selection], mask_y[selection]]))
 
             points = torch.stack(points, dim=0)
@@ -82,10 +84,7 @@ def construct_input(image, target):
         bbox = get_bbox_from_target(new_target)
         point = get_point_from_target(new_target)
 
-        import pdb
-        pdb.set_trace()
-
-        return image, new_target, bbox
+        return image, new_target, bbox, point
 
 class SA1B_Dataset(torchvision.datasets.ImageFolder):
     """A data loader for the SA-1B Dataset from "Segment Anything" (SAM)
@@ -150,7 +149,7 @@ if __name__=="__main__":
     SA1Bdataset = SA1B_Dataset(path, transform=input_transforms, target_transform=target_transforms)
     for idx in range(len(SA1Bdataset)):
         image, target = SA1Bdataset[idx]
-        img, ntg, bbox = construct_input(image, target)
-        joblib.dump([img.numpy(), ntg.numpy(), bbox.numpy()],'%s/sa1b%07i.pkl' % (Save_path, idx))
+        img, ntg, bbox, point = construct_input(image, target)
+        joblib.dump([img.numpy(), ntg.numpy(), bbox.numpy(), point.numpy()],'%s/sa1b%07i.pkl' % (Save_path, idx))
         print('Preparing data ',idx , 'out of', len(SA1Bdataset))
     
