@@ -24,67 +24,210 @@ target_transforms = transforms.Compose([
     transforms.Resize((160, 256)),
 ])
 
-def construct_input(image, target):
-        # Lists input
-        def load_num_masks(target, NUM_MASK_PER_IMG):
-            num_masks = target.shape[0]
-            selected = []
-            if num_masks >= NUM_MASK_PER_IMG :
-                mask_size = torch.count_nonzero(target,dim=(-2,-1))
-                select_mask_indices = torch.argsort(mask_size,descending=True)[:NUM_MASK_PER_IMG].numpy()
-                # all_mask_index = np.arange(num_masks)
-                # np.random.shuffle(all_mask_index)
-                # select_mask_indices = all_mask_index[:NUM_MASK_PER_IMG]
-            else:
-                select_mask_indices = np.arange(num_masks)
-                for _ in range(NUM_MASK_PER_IMG-num_masks):
-                  select_mask_indices = np.append(select_mask_indices, select_mask_indices[-1])
+# def construct_input(image, target):
+#         # Lists input
+#         def load_num_masks(target, NUM_MASK_PER_IMG):
+#             num_masks = target.shape[0]
+#             selected = []
+#             if num_masks >= NUM_MASK_PER_IMG :
+#                 mask_size = torch.count_nonzero(target,dim=(-2,-1))
+#                 select_mask_indices = torch.argsort(mask_size,descending=True)[:NUM_MASK_PER_IMG].numpy()
+#                 # all_mask_index = np.arange(num_masks)
+#                 # np.random.shuffle(all_mask_index)
+#                 # select_mask_indices = all_mask_index[:NUM_MASK_PER_IMG]
+#             else:
+#                 select_mask_indices = np.arange(num_masks)
+#                 for _ in range(NUM_MASK_PER_IMG-num_masks):
+#                   select_mask_indices = np.append(select_mask_indices, select_mask_indices[-1])
 
-            # Select only 
-            for ind in select_mask_indices:
-                m = target[ind]
-                # decode masks from COCO RLE format
-                selected.append(m)
+#             # Select only 
+#             for ind in select_mask_indices:
+#                 m = target[ind]
+#                 # decode masks from COCO RLE format
+#                 selected.append(m)
 
-            target = torch.stack(selected, dim=0)
-            return target
+#             target = torch.stack(selected, dim=0)
+#             return target
 
-        def get_bbox_from_target(target):
-            bbox = []
-            for mask in target:
-                mask_y, mask_x = torch.where(mask > 0)
-                x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
+#         def get_bbox_from_target(target):
+#             bbox = []
+#             for mask in target:
+#                 mask_y, mask_x = torch.where(mask > 0)
+#                 x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
                 
-                center_x = (x1 + x2) / 2
-                center_y = (y1 + y2) / 2
-                w = (x2 - x1)
-                h = (y2 - y1)
-                delta_w = min(random.random() * 0.2 * w, 20)
-                delta_h = min(random.random() * 0.2 * h, 20)
+#                 center_x = (x1 + x2) / 2
+#                 center_y = (y1 + y2) / 2
+#                 w = (x2 - x1)
+#                 h = (y2 - y1)
+#                 delta_w = min(random.random() * 0.2 * w, 20)
+#                 delta_h = min(random.random() * 0.2 * h, 20)
 
-                x1, y1, x2, y2  = center_x - (w + delta_w) / 2, center_y - (h + delta_h) / 2, \
-                                    center_x + (w + delta_w) / 2, center_y + (h + delta_h) / 2
-                bbox.append(torch.tensor([x1, y1, x2, y2]))
+#                 x1, y1, x2, y2  = center_x - (w + delta_w) / 2, center_y - (h + delta_h) / 2, \
+#                                     center_x + (w + delta_w) / 2, center_y + (h + delta_h) / 2
+#                 bbox.append(torch.tensor([x1, y1, x2, y2]))
 
-            bbox = torch.stack(bbox, dim=0)
-            return bbox
+#             bbox = torch.stack(bbox, dim=0)
+#             return bbox
 
-        def get_point_from_target(target):
-            points = []
-            for mask in target:
-                mask_y, mask_x = torch.where(mask > 0)
-                selection = random.randint(0, mask_y.shape[0]-1)
-                points.append(torch.tensor([mask_x[selection], mask_y[selection]]))
+#         # def get_point_from_target(target):
+#         #     points = []
+#         #     for mask in target:
+#         #         mask_y, mask_x = torch.where(mask > 0)
+#         #         selection = random.randint(0, mask_y.shape[0]-1)
+#         #         points.append(torch.tensor([mask_x[selection], mask_y[selection]]))
 
-            points = torch.stack(points, dim=0)
-            return points
+#         #     points = torch.stack(points, dim=0)
+#         #     return points
+#         def get_random_points(target, num_points=16):
+#             """随机生成 num_points 个不同的点提示"""
+#             points = []
+#             for _ in range(num_points):
+#                 valid = False
+#                 while not valid:
+#                     y, x = torch.randint(0, target.shape[1], (1,)).item(), torch.randint(0, target.shape[2], (1,)).item()
+#                     if target[:, y, x].sum() > 0:  # 至少有一个掩码覆盖该点
+#                         valid = True
+#                         points.append([x, y])
+#             points = torch.tensor(points, dtype=torch.float32)
+#             return points
 
-        new_target = load_num_masks(target,16)
+#         def generate_gt_masks(target, points, num_masks=3):
+#             """为每个点提示生成一个 `3xHxW` 的 ground truth 掩码"""
+#             gt_masks = []
+#             for x, y in points:
+#                 intersecting_masks = target[:, int(y), int(x)] > 0
+#                 intersecting_indices = torch.where(intersecting_masks)[0]
+
+#                 if len(intersecting_indices) == 0:  # 没有相交掩码
+#                     gt_mask = torch.zeros((num_masks, *target.shape[1:]), dtype=target.dtype)
+#                 else:
+#                     # 按掩码大小排序
+#                     sizes = [target[idx].sum().item() for idx in intersecting_indices]
+#                     sorted_indices = [intersecting_indices[i] for i in torch.argsort(torch.tensor(sizes), descending=True)]
+
+#                     # 构建 ground truth mask
+#                     gt_mask = torch.zeros((num_masks, *target.shape[1:]), dtype=target.dtype)
+#                     for i, idx in enumerate(sorted_indices[:num_masks]):
+#                         gt_mask[i] = target[idx]
+#                 gt_masks.append(gt_mask)
+#             return torch.stack(gt_masks, dim=0)
+
+#         # 生成随机点提示
+#         points = get_random_points(target, num_points=16)
+#         # 为每个点提示生成 ground truth 掩码
+#         gt_masks = generate_gt_masks(target, points)
+#         # new_target = load_num_masks(target,16)
         
-        bbox = get_bbox_from_target(new_target)
-        point = get_point_from_target(new_target)
+#         # bbox = get_bbox_from_target(new_target)
+#         # point = get_point_from_target(new_target)
+#         bbox = None
 
-        return image, new_target, bbox, point
+#         return image, gt_masks, bbox, points
+def construct_input(image, target):
+    def get_sorted_masks(target):
+        """按掩码大小从大到小排序"""
+        sizes = [mask.sum().item() for mask in target]
+        sorted_indices = torch.argsort(torch.tensor(sizes), descending=True)
+        return target[sorted_indices]
+
+    def get_random_points(target, num_points=16):
+        """从前 16 个最大掩码中采样 num_points 个点"""
+        points = []
+        sorted_target = get_sorted_masks(target)[:16]  # 获取前 16 个最大掩码
+
+        for mask in sorted_target:
+            mask_y, mask_x = torch.where(mask > 0)
+            if len(mask_y) == 0:  # 跳过无前景的掩码
+                continue
+            for _ in range(1):  # 每个掩码选一个点
+                idx = torch.randint(0, len(mask_y), (1,)).item()
+                points.append([mask_x[idx].item(), mask_y[idx].item()])
+            if len(points) == num_points:
+                break
+
+        # 如果点数不足，重复已有点
+        while len(points) < num_points:
+            points.append(points[len(points) % len(points)])
+        return torch.tensor(points, dtype=torch.float32)
+
+    def get_random_boxes(target, num_boxes=16):
+        """从前 16 个最大掩码中生成 num_boxes 个边界框"""
+        boxes = []
+        sorted_target = get_sorted_masks(target)[:16]  # 获取前 16 个最大掩码
+
+        for mask in sorted_target:
+            mask_y, mask_x = torch.where(mask > 0)
+            if len(mask_y) == 0:  # 跳过无前景的掩码
+                continue
+
+            x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
+            width, height = x2 - x1, y2 - y1
+
+            # 为当前掩码生成一个加噪的边界框
+            dx1, dy1 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
+            dx2, dy2 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
+
+            dx1, dy1, dx2, dy2 = torch.clamp(torch.tensor([dx1, dy1, dx2, dy2]), -20, 20)
+            noisy_box = [
+                max(0, x1 + dx1), max(0, y1 + dy1),
+                min(target.shape[2], x2 + dx2), min(target.shape[1], y2 + dy2)
+            ]
+            boxes.append(noisy_box)
+            if len(boxes) == num_boxes:
+                break
+
+        # 如果边界框数量不足，重复已有边界框
+        while len(boxes) < num_boxes:
+            boxes.append(boxes[len(boxes) % len(boxes)])
+        return torch.tensor(boxes, dtype=torch.float32)
+
+    def generate_gt_masks(target, prompts, num_masks=3, prompt_type="point"):
+        """为每个点或边界框生成 3xHxW 的 ground truth 掩码"""
+        gt_masks = []
+        for prompt in prompts:
+            if prompt_type == "point":
+                x, y = prompt
+                intersecting_masks = target[:, int(y), int(x)] > 0
+            elif prompt_type == "box":
+                x1, y1, x2, y2 = map(int, prompt)
+                intersecting_masks = target[:, y1:y2, x1:x2].sum(dim=(1, 2)) > 0
+
+            intersecting_indices = torch.where(intersecting_masks)[0]
+            if len(intersecting_indices) == 0:
+                gt_mask = torch.zeros((num_masks, *target.shape[1:]), dtype=target.dtype)
+            else:
+                sizes = [target[idx].sum().item() for idx in intersecting_indices]
+                sorted_indices = torch.argsort(torch.tensor(sizes), descending=True)
+
+                # 获取相交掩码
+                intersecting_masks = [target[intersecting_indices[idx]] for idx in sorted_indices]
+
+                # 如果掩码不足 3 个，重复最大的掩码
+                while len(intersecting_masks) < num_masks:
+                    intersecting_masks.append(intersecting_masks[0])  # 重复最大的掩码
+
+                # 只保留前 num_masks 个掩码
+                intersecting_masks = intersecting_masks[:num_masks]
+
+                # 构建 ground truth 掩码
+                gt_mask = torch.stack(intersecting_masks, dim=0)
+
+            gt_masks.append(gt_mask)
+
+        return torch.stack(gt_masks, dim=0)
+
+    # 按掩码大小排序 target
+    target = get_sorted_masks(target)
+
+    # 生成随机点提示
+    points = get_random_points(target, num_points=16)
+    gt_masks_points = generate_gt_masks(target, points, prompt_type="point")
+
+    # 生成随机边界框
+    boxes = get_random_boxes(target, num_boxes=16)
+    gt_masks_boxes = generate_gt_masks(target, boxes, prompt_type="box")
+
+    return image, gt_masks_points, points, gt_masks_boxes, boxes
 
 class SA1B_Dataset(torchvision.datasets.ImageFolder):
     """A data loader for the SA-1B Dataset from "Segment Anything" (SAM)
@@ -142,14 +285,14 @@ class SA1B_Dataset(torchvision.datasets.ImageFolder):
 
 
 if __name__=="__main__":
-    Save_path = './train_data'
+    Save_path = 'E:\data\lora_sam'
     import pdb
 
     path = './sa1b'
     SA1Bdataset = SA1B_Dataset(path, transform=input_transforms, target_transform=target_transforms)
     for idx in range(len(SA1Bdataset)):
         image, target = SA1Bdataset[idx]
-        img, ntg, bbox, point = construct_input(image, target)
-        joblib.dump([img.numpy(), ntg.numpy(), bbox.numpy(), point.numpy()],'%s/sa1b%07i.pkl' % (Save_path, idx))
+        image, gt_masks_points, points, gt_masks_boxes, boxes = construct_input(image, target)
+        joblib.dump([image.numpy(), gt_masks_points.numpy(), points.numpy(), gt_masks_boxes.numpy(), boxes.numpy()],'%s/sa1b%07i.pkl' % (Save_path, idx))
         print('Preparing data ',idx , 'out of', len(SA1Bdataset))
     
