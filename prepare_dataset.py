@@ -24,125 +24,108 @@ target_transforms = transforms.Compose([
     transforms.Resize((160, 256)),
 ])
 
+
+def get_sorted_masks(target):
+    """按掩码大小从大到小排序"""
+    sizes = [mask.sum().item() for mask in target]
+    sorted_indices = torch.argsort(torch.tensor(sizes), descending=True)
+    return target[sorted_indices]
+
+def pad_masks(masks, target_num):
+    """
+    填补 mask 数量不足的情况，用最大的 mask 填充
+    :param masks: 当前的 mask 列表
+    :param target_num: 目标数量
+    :return: 填充后的 mask 列表
+    """
+    while len(masks) < target_num:
+        masks.append(masks[len(masks) % len(masks)])
+    return masks[:target_num]
+
+def get_center_points(target, num_points=16):
+    """
+    获取每个掩码的中心点，最多选取 num_points 个
+    :param target: 输入的目标掩码
+    :return: 中心点和对应的 mask
+    """
+    points = []
+    masks = []
+    sorted_target = get_sorted_masks(target)
+
+    for mask in sorted_target:
+        mask_y, mask_x = torch.where(mask > 0)
+        if len(mask_y) == 0:
+            continue
+        # 计算中心点
+        center_x = (mask_x.min() + mask_x.max()) // 2
+        center_y = (mask_y.min() + mask_y.max()) // 2
+        points.append([center_x.item(), center_y.item()])
+        masks.append(mask)
+        if len(points) == num_points:
+            break
+
+    # 填补不足的点和 mask
+    masks = pad_masks(masks, num_points)
+    while len(points) < num_points:
+        points.append(points[len(points) % len(points)])
+
+    return torch.tensor(points, dtype=torch.float32), torch.stack(masks, dim=0)
+
+def get_random_boxes(target, num_boxes=16):
+    """
+    从前 num_boxes 个最大掩码中生成边界框，并添加扰动
+    :param target: 输入的目标掩码
+    :return: 边界框和对应的 mask
+    """
+    boxes = []
+    masks = []
+    sorted_target = get_sorted_masks(target)
+
+    for mask in sorted_target:
+        mask_y, mask_x = torch.where(mask > 0)
+        if len(mask_y) == 0:
+            continue
+
+        x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
+        width, height = x2 - x1, y2 - y1
+
+        # 加扰动
+        dx1, dy1 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
+        dx2, dy2 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
+
+        dx1, dy1, dx2, dy2 = torch.clamp(torch.tensor([dx1, dy1, dx2, dy2]), -20, 20)
+        noisy_box = [
+            max(0, x1 + dx1.item()),
+            max(0, y1 + dy1.item()),
+            min(target.shape[2], x2 + dx2.item()),
+            min(target.shape[1], y2 + dy2.item()),
+        ]
+        boxes.append(noisy_box)
+        masks.append(mask)
+        if len(boxes) == num_boxes:
+            break
+
+    # 填补不足的边界框和 mask
+    masks = pad_masks(masks, num_boxes)
+    while len(boxes) < num_boxes:
+        boxes.append(boxes[len(boxes) % len(boxes)])
+
+    return torch.tensor(boxes, dtype=torch.float32), torch.stack(masks, dim=0)
+
 def construct_input(image, target):
-    def get_sorted_masks(target):
-        """按掩码大小从大到小排序"""
-        sizes = [mask.sum().item() for mask in target]
-        sorted_indices = torch.argsort(torch.tensor(sizes), descending=True)
-        return target[sorted_indices]
+    """
+    构造输入，包括点、边界框和对应的掩码
+    :param image: 输入图像
+    :param target: 输入目标掩码
+    :return: 构造好的输入
+    """
+    # 获取点提示
+    points, gt_masks_points = get_center_points(target)
 
-    def get_random_points(target, num_points=16):
-        """从前 16 个最大掩码中采样 num_points 个点"""
-        points = []
-        sorted_target = get_sorted_masks(target)[:16]  # 获取前 16 个最大掩码
-
-        for mask in sorted_target:
-            mask_y, mask_x = torch.where(mask > 0)
-            if len(mask_y) == 0:  # 跳过无前景的掩码
-                continue
-            for _ in range(1):  # 每个掩码选一个点
-                idx = torch.randint(0, len(mask_y), (1,)).item()
-                points.append([mask_x[idx].item(), mask_y[idx].item()])
-            if len(points) == num_points:
-                break
-
-        # 如果点数不足，重复已有点
-        while len(points) < num_points:
-            points.append(points[len(points) % len(points)])
-        return torch.tensor(points, dtype=torch.float32)
-
-    def get_random_boxes(target, num_boxes=16):
-        """从前 16 个最大掩码中生成 num_boxes 个边界框"""
-        boxes = []
-        sorted_target = get_sorted_masks(target)[:16]  # 获取前 16 个最大掩码
-
-        for mask in sorted_target:
-            mask_y, mask_x = torch.where(mask > 0)
-            if len(mask_y) == 0:  # 跳过无前景的掩码
-                continue
-
-            x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
-            width, height = x2 - x1, y2 - y1
-
-            # 为当前掩码生成一个加噪的边界框
-            dx1, dy1 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
-            dx2, dy2 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
-
-            dx1, dy1, dx2, dy2 = torch.clamp(torch.tensor([dx1, dy1, dx2, dy2]), -20, 20)
-            noisy_box = [
-                max(0, x1 + dx1), max(0, y1 + dy1),
-                min(target.shape[2], x2 + dx2), min(target.shape[1], y2 + dy2)
-            ]
-            boxes.append(noisy_box)
-            if len(boxes) == num_boxes:
-                break
-
-        # 如果边界框数量不足，重复已有边界框
-        while len(boxes) < num_boxes:
-            boxes.append(boxes[len(boxes) % len(boxes)])
-        return torch.tensor(boxes, dtype=torch.float32)
-
-    def generate_gt_masks(target, prompts, num_masks=3, prompt_type="point"):
-        """为每个点或边界框生成 3xHxW 的 ground truth 掩码"""
-        gt_masks = []
-        for prompt in prompts:
-            if prompt_type == "point":
-                x, y = prompt
-                intersecting_masks = target[:, int(y), int(x)] > 0
-            elif prompt_type == "box":
-                x1, y1, x2, y2 = map(int, prompt)
-                intersecting_masks = target[:, y1:y2, x1:x2].sum(dim=(1, 2)) > 0
-
-            intersecting_indices = torch.where(intersecting_masks)[0]
-            if len(intersecting_indices) == 0:
-                gt_mask = torch.zeros((num_masks, *target.shape[1:]), dtype=target.dtype)
-            else:
-                sizes = [target[idx].sum().item() for idx in intersecting_indices]
-                sorted_indices = torch.argsort(torch.tensor(sizes), descending=True)
-
-                # 获取相交掩码
-                intersecting_masks = [target[intersecting_indices[idx]] for idx in sorted_indices]
-
-                # 如果掩码不足 3 个，重复最大的掩码
-                while len(intersecting_masks) < num_masks:
-                    intersecting_masks.append(intersecting_masks[0])  # 重复最大的掩码
-
-                # 只保留前 num_masks 个掩码
-                intersecting_masks = intersecting_masks[:num_masks]
-
-                # 构建 ground truth 掩码
-                gt_mask = torch.stack(intersecting_masks, dim=0)
-
-            gt_masks.append(gt_mask)
-
-        return torch.stack(gt_masks, dim=0)
-
-    # 按掩码大小排序 target
-    target = get_sorted_masks(target)
-
-    # 生成随机点提示
-    points = get_random_points(target, num_points=16)
-    gt_masks_points = generate_gt_masks(target, points, prompt_type="point")
-
-    # 生成随机边界框
-    boxes = get_random_boxes(target, num_boxes=16)
-    gt_masks_boxes = generate_gt_masks(target, boxes, prompt_type="box")
+    # 获取边界框
+    boxes, gt_masks_boxes = get_random_boxes(target)
 
     return image, gt_masks_points, points, gt_masks_boxes, boxes
-
-    # 按掩码大小排序 target
-    target = get_sorted_masks(target)
-
-    # 生成随机点提示
-    points = get_random_points(target, num_points=16)
-    gt_masks_points = generate_gt_masks(target, points, prompt_type="point")
-
-    # 生成随机边界框
-    boxes = get_random_boxes(target, num_boxes=16)
-    gt_masks_boxes = generate_gt_masks(target, boxes, prompt_type="box")
-
-    return image, gt_masks_points, points, gt_masks_boxes, boxes
-
 
 
 class SA1B_Dataset(torchvision.datasets.ImageFolder):
