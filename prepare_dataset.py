@@ -26,34 +26,35 @@ target_transforms = transforms.Compose([
 
 def construct_input(image, target):
     def get_random_points(target, num_points=16):
-        """从掩码中均匀采样 num_points 个前景点"""
+        """从所有掩码中随机采样 num_points 个前景点"""
         points = []
-        for mask in target:
-            mask_y, mask_x = torch.where(mask > 0)
-            for _ in range(num_points):
-                idx = torch.randint(0, len(mask_y), (1,)).item()
-                points.append([mask_x[idx], mask_y[idx]])
-        points = torch.tensor(points, dtype=torch.float32)
-        return points
+        mask_y, mask_x = torch.where(target.sum(dim=0) > 0)  # 聚合所有掩码的前景区域
+        idx = torch.randint(0, len(mask_y), (num_points,))
+        points = [[mask_x[i].item(), mask_y[i].item()] for i in idx]
+        return torch.tensor(points, dtype=torch.float32)
 
     def get_random_boxes(target, num_boxes=16):
         """生成 num_boxes 个加噪边界框"""
         boxes = []
-        for mask in target:
-            mask_y, mask_x = torch.where(mask > 0)
+        for _ in range(num_boxes):
+            # 聚合所有掩码的前景区域
+            mask_y, mask_x = torch.where(target.sum(dim=0) > 0)
+            if len(mask_y) == 0:
+                boxes.append([0, 0, 0, 0])  # 没有前景时返回空框
+                continue
             x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
             width, height = x2 - x1, y2 - y1
 
-            for _ in range(num_boxes):
-                dx1, dy1 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
-                dx2, dy2 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
+            # 添加噪声
+            dx1, dy1 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
+            dx2, dy2 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
 
-                dx1, dy1, dx2, dy2 = torch.clamp(torch.tensor([dx1, dy1, dx2, dy2]), -20, 20)
-                noisy_box = [
-                    max(0, x1 + dx1), max(0, y1 + dy1),
-                    min(target.shape[2], x2 + dx2), min(target.shape[1], y2 + dy2)
-                ]
-                boxes.append(noisy_box)
+            dx1, dy1, dx2, dy2 = torch.clamp(torch.tensor([dx1, dy1, dx2, dy2]), -20, 20)
+            noisy_box = [
+                max(0, x1 + dx1), max(0, y1 + dy1),
+                min(target.shape[2], x2 + dx2), min(target.shape[1], y2 + dy2)
+            ]
+            boxes.append(noisy_box)
         return torch.tensor(boxes, dtype=torch.float32)
 
     def generate_gt_masks(target, prompts, num_masks=3, prompt_type="point"):
@@ -86,6 +87,7 @@ def construct_input(image, target):
     # 生成随机边界框
     boxes = get_random_boxes(target, num_boxes=16)
     gt_masks_boxes = generate_gt_masks(target, boxes, prompt_type="box")
+    print(gt_masks_points.shape)
 
     return image, gt_masks_points, points, gt_masks_boxes, boxes
 
