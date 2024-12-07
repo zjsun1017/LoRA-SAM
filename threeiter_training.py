@@ -214,13 +214,15 @@ class MyFastSAM(pl.LightningModule):
         score = [predictions[j]['iou_predictions'] for j in range(len(predictions))]
         score = torch.stack(score, dim=0)
 
-        logits = [predictions[j]['low_res_logits'][:,torch.argmax(predictions[j]['iou_predictions'],dim=-1)].detach() for j in range(len(predictions))]
+        logits = [predictions[j]['low_res_logits'] for j in range(len(predictions))]
+        logits = torch.stack(logits, dim=0)
         
         all_fl = []
         all_dl = []
         all_loss = []
         all_iou = []
         all_pred = []
+        all_logits = []
         for j in range(pred.shape[1]): # querys
             losses = []
             fls = []
@@ -251,12 +253,14 @@ class MyFastSAM(pl.LightningModule):
             all_dl.append( dls[chosen_loss])
             all_iou.append( ious[chosen_loss])
             all_pred.append(pred[0,j,chosen_loss])
+            all_logits.append(logits[0,j,chosen_loss])
         # pdb.set_trace()
         all_loss = torch.mean(torch.stack(all_loss, dim=0))
         all_fl = torch.mean(torch.stack(all_fl, dim=0))
         all_dl = torch.mean(torch.stack(all_dl, dim=0))
         all_iou = torch.mean(torch.stack(all_iou, dim=0))
         all_pred = torch.stack(all_pred, dim=0).unsqueeze(0)
+        all_logits = torch.stack(all_logits, dim=0).unsqueeze(0)
         all_loss.backward()
         # pdb.set_trace()
         # iou_loss, iou = self.iou_token_loss(score, pred, target)
@@ -266,24 +270,29 @@ class MyFastSAM(pl.LightningModule):
 
         add_points = []
         add_label = []
-        pred_hard = pred>0
-        error_region = target-pred_hard
-        mask_y, mask_x = torch.where(error_region != 0)
-        selection = random.randint(0, mask_y.shape[0]-1)
-        add_points.append(torch.tensor([mask_x[selection], mask_y[selection]]))
-        add_label.append(torch.tensor([0 if error_region[mask_y[selection],mask_x[selection]]==-1 else 1]))
+        pred_hard = all_pred>0
+        error_region = target.to(torch.float32)-pred_hard.to(torch.float32)
 
+        error_region = error_region.squeeze(0)
+        for er in error_region:
+            # pdb.set_trace()
+            mask_y, mask_x = torch.where(er != 0)
+            selection = random.randint(0, mask_y.shape[0]-1)
+            add_points.append(torch.tensor([mask_x[selection], mask_y[selection]]))
+            add_label.append(torch.tensor([0 if er[mask_y[selection],mask_x[selection]]==-1 else 1]))
+        add_points = torch.stack(add_points,dim=0).unsqueeze(0)
+        add_label = torch.stack(add_label,dim=0).unsqueeze(0)
         batch_prediction = {
             'images':images.cpu(),
             'target':target.cpu(),
             'prompt':prompt.cpu(),
-            'pred':all_pred.detach().cpu(),
+            'pred':pred_hard.detach().cpu(),
         }
         # self.log('train_loss', loss.item(), prog_bar=True)
 
         # During training, we backprop only the minimum loss over the 3 output masks.
         # sam paper main text Section 3
-        return fl.item(), dl.item(), iou_loss.item(), torch.mean(iou).item(), batch_prediction, all_pred.detach(), add_points, add_label
+        return fl.item(), dl.item(), iou_loss.item(), torch.mean(iou).item(), batch_prediction, all_logits.detach(), add_points, add_label
 
     def validation_step(self, batch, batch_idx):
         images, targets = batch
@@ -297,13 +306,13 @@ class MyFastSAM(pl.LightningModule):
         device = self.device
 
         if len(logits) != 0:
-            pdb.set_trace()
+            # pdb.set_trace()
             batch_input = [{
                 'image':image[j].to(device)*255,
                 'original_size':(160, 256),
                 'point_coords':torch.cat([points[j].to(device).to(torch.float32).unsqueeze(1), adp[j].to(device).to(torch.float32).unsqueeze(1)], dim = 1),
-                'point_labels' : torch.cat([torch.ones(points[j].shape[0]).to(device).to(torch.int).unsqueeze(1),adl[j].to(device).to(torch.int).unsqueeze(1)],dim = 1),
-                'mask_inputs': logits[j].to(device).to(torch.float32),
+                'point_labels' : torch.cat([torch.ones(points[j].shape[0]).to(device).to(torch.int).unsqueeze(1),adl[j].to(device).to(torch.int)],dim = 1),
+                'mask_inputs': logits[j].to(device).to(torch.float32).squeeze(0).unsqueeze(1),
                 'target': gt_masks_points[j].to(device)
             } for j in range(image.shape[0])] 
         else:
@@ -382,8 +391,8 @@ def visualize_batch(images, pred, target, bbox):
         ax_gt = axes[i, 0] if batch_size > 1 else axes[0]
         ax_gt.imshow(images[i].permute(1, 2, 0).cpu().numpy())  # Assuming images are [C, H, W]
         ax_gt.set_title(f"Image + GT (Sample {i})")
-        for mask in target[i]:
-            for ms in mask:
+        for ms in target[i]:
+            # for ms in mask:
                 show_mask(ms.cpu().numpy(), ax_gt)
         # ax_gt.axis('off')
 
@@ -391,8 +400,8 @@ def visualize_batch(images, pred, target, bbox):
         ax_pred = axes[i, 1] if batch_size > 1 else axes[1]
         ax_pred.imshow(images[i].permute(1, 2, 0).cpu().numpy())
         ax_pred.set_title(f"Image + Pred (Sample {i})")
-        for mask in pred[i]:
-            for ms in mask:
+        for ms in pred[i]:
+            # for ms in mask:
                 show_mask(ms.cpu().numpy(), ax_pred)
         # ax_pred.axis('off')
 
@@ -460,7 +469,7 @@ writer = SummaryWriter('%s/%s/%s' % (args.result_dir, args.log_dir, start_time))
 print('[tensorboard] %s/%s/%s' % (args.result_dir, args.log_dir, start_time))
 save_dir = '%s/%s/%s' % (args.result_dir, args.log_dir, start_time)
 
-path = 'E:\data\lora_sam'
+path = 'train_data'
 SA1Bdataset = SA1B_Dataset(path)
 train_loader = DataLoader(SA1Bdataset,batch_size=1,shuffle=True)#,collate_fn=collate_fn)
 
@@ -485,11 +494,11 @@ if args.train:
             fl, dl, iou_loss, iou, batch1, logits, adp, adl = model.training_step(data)
             fl, dl, iou_loss, iou, batch2, logits, adp, adl = model.training_step(data, logits, adp, adl)
             fl, dl, iou_loss, iou, batch3, logits, adp, adl = model.training_step(data, logits, adp, adl)
-
+            # pdb.set_trace()
             img_vis = torch.cat([batch1['images'],batch2['images'],batch3['images']], dim = 0)
             pred_vis = torch.cat([batch1['pred'],batch2['pred'],batch3['pred']], dim = 0)
             target_vis = torch.cat([batch1['target'],batch2['target'],batch3['target']], dim = 0)
-            prompt_vis = torch.cat([batch1['prompt'],batch2['prompt'],batch3['prompt']], dim = 0)
+            prompt_vis = [batch1['prompt'],batch2['prompt'],batch3['prompt']]
             if iter%200==0:
 
                 writer.add_scalar('train/fl',fl,global_step=i*total_step+iter)
