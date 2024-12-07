@@ -24,36 +24,55 @@ target_transforms = transforms.Compose([
     transforms.Resize((160, 256)),
 ])
 
-
 def construct_input(image, target):
     def get_random_points(target, num_points=16):
-        """随机生成 num_points 个不同的点提示"""
+        """从掩码中均匀采样 num_points 个前景点"""
         points = []
-        for _ in range(num_points):
-            valid = False
-            while not valid:
-                y, x = torch.randint(0, target.shape[1], (1,)).item(), torch.randint(0, target.shape[2], (1,)).item()
-                if target[:, y, x].sum() > 0:  # 至少有一个掩码覆盖该点
-                    valid = True
-                    points.append([x, y])
+        for mask in target:
+            mask_y, mask_x = torch.where(mask > 0)
+            for _ in range(num_points):
+                idx = torch.randint(0, len(mask_y), (1,)).item()
+                points.append([mask_x[idx], mask_y[idx]])
         points = torch.tensor(points, dtype=torch.float32)
         return points
 
-    def generate_gt_masks(target, points, num_masks=3):
-        """为每个点提示生成一个 `3xHxW` 的 ground truth 掩码"""
-        gt_masks = []
-        for x, y in points:
-            intersecting_masks = target[:, int(y), int(x)] > 0
-            intersecting_indices = torch.where(intersecting_masks)[0]
+    def get_random_boxes(target, num_boxes=16):
+        """生成 num_boxes 个加噪边界框"""
+        boxes = []
+        for mask in target:
+            mask_y, mask_x = torch.where(mask > 0)
+            x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
+            width, height = x2 - x1, y2 - y1
 
-            if len(intersecting_indices) == 0:  # 没有相交掩码
+            for _ in range(num_boxes):
+                dx1, dy1 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
+                dx2, dy2 = torch.normal(0, 0.1 * width), torch.normal(0, 0.1 * height)
+
+                dx1, dy1, dx2, dy2 = torch.clamp(torch.tensor([dx1, dy1, dx2, dy2]), -20, 20)
+                noisy_box = [
+                    max(0, x1 + dx1), max(0, y1 + dy1),
+                    min(target.shape[2], x2 + dx2), min(target.shape[1], y2 + dy2)
+                ]
+                boxes.append(noisy_box)
+        return torch.tensor(boxes, dtype=torch.float32)
+
+    def generate_gt_masks(target, prompts, num_masks=3, prompt_type="point"):
+        """为每个点或边界框生成 3xHxW 的 ground truth 掩码"""
+        gt_masks = []
+        for prompt in prompts:
+            if prompt_type == "point":
+                x, y = prompt
+                intersecting_masks = target[:, int(y), int(x)] > 0
+            elif prompt_type == "box":
+                x1, y1, x2, y2 = map(int, prompt)
+                intersecting_masks = target[:, y1:y2, x1:x2].sum(dim=(1, 2)) > 0
+
+            intersecting_indices = torch.where(intersecting_masks)[0]
+            if len(intersecting_indices) == 0:
                 gt_mask = torch.zeros((num_masks, *target.shape[1:]), dtype=target.dtype)
             else:
-                # 按掩码大小排序
                 sizes = [target[idx].sum().item() for idx in intersecting_indices]
                 sorted_indices = [intersecting_indices[i] for i in torch.argsort(torch.tensor(sizes), descending=True)]
-
-                # 构建 ground truth mask
                 gt_mask = torch.zeros((num_masks, *target.shape[1:]), dtype=target.dtype)
                 for i, idx in enumerate(sorted_indices[:num_masks]):
                     gt_mask[i] = target[idx]
@@ -62,9 +81,14 @@ def construct_input(image, target):
 
     # 生成随机点提示
     points = get_random_points(target, num_points=16)
-    # 为每个点提示生成 ground truth 掩码
-    gt_masks = generate_gt_masks(target, points)
-    return image, gt_masks, points
+    gt_masks_points = generate_gt_masks(target, points, prompt_type="point")
+
+    # 生成随机边界框
+    boxes = get_random_boxes(target, num_boxes=16)
+    gt_masks_boxes = generate_gt_masks(target, boxes, prompt_type="box")
+
+    return image, gt_masks_points, points, gt_masks_boxes, boxes
+
 
 class SA1B_Dataset(torchvision.datasets.ImageFolder):
     """A data loader for the SA-1B Dataset from "Segment Anything" (SAM)
@@ -122,11 +146,6 @@ class SA1B_Dataset(torchvision.datasets.ImageFolder):
 
 
 if __name__ == "__main__":
-    import os
-    import joblib
-    import torch
-    from tqdm import tqdm
-
     Save_path = './train_data'
     os.makedirs(Save_path, exist_ok=True)
 
@@ -139,11 +158,11 @@ if __name__ == "__main__":
             # 加载数据
             image, target = SA1Bdataset[idx]
             # 构建输入
-            img, gt_masks, points = construct_input(image, target)
+            img, gt_masks_points, points, gt_masks_boxes, boxes = construct_input(image, target)
             # 保存到文件
             joblib.dump(
-                [img.numpy(), gt_masks.numpy(), points.numpy()],
-                '%s/sa1b%07i.pkl' % (Save_path, idx)
+                [img.numpy(), gt_masks_points.numpy(), points.numpy(), gt_masks_boxes.numpy(), boxes.numpy()],
+                f'{Save_path}/sa1b{idx:07d}.pkl'
             )
         except Exception as e:
             print(f"Error processing index {idx}: {e}")

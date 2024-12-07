@@ -73,10 +73,14 @@ class PKL_Dataset(Dataset):
 
     def __getitem__(self, index):
         # 加载预处理好的数据
-        image, gt_masks, points = joblib.load(self.files[index])
-        return torch.tensor(image, dtype=torch.float32), \
-            torch.tensor(gt_masks, dtype=torch.float32), \
-            torch.tensor(points, dtype=torch.float32)
+        image, gt_masks_points, points, gt_masks_boxes, boxes = joblib.load(self.files[index])
+        return (
+            torch.tensor(image, dtype=torch.float32),  # 图像
+            torch.tensor(gt_masks_points, dtype=torch.float32),  # 点提示的掩码
+            torch.tensor(points, dtype=torch.float32),  # 点提示
+            torch.tensor(gt_masks_boxes, dtype=torch.float32),  # 边界框的掩码
+            torch.tensor(boxes, dtype=torch.float32)  # 边界框
+        )
 
     def __len__(self):
         return len(self.files)
@@ -195,25 +199,45 @@ class MyFastSAM(pl.LightningModule):
 
         return (iou_prediction - iou) ** 2, iou
 
-
     def training_step(self, batch):
         self.lora_sam.train()
 
         # 从 batch 中加载数据
-        images, gt_masks, points = batch  # 从 DataLoader 提供的数据中提取
+        images, gt_masks_points, points, gt_masks_boxes, boxes = batch  # DataLoader 提供的数据
         device = self.device
 
-        batched_input = [{
-            'image': images[j].to(device),
-            'original_size': images[j].shape[1:],
-            'point_coords': points[j].unsqueeze(1).to(device),
-            'point_labels': torch.ones(points[j].shape[0], 1).to(device),  # 点提示标签
-            'target': gt_masks[j].to(device),  # ground truth 掩码
-        } for j in range(len(images))]
+        # 随机选择点提示或边界框提示
+        if random.random() < 0.5:  # 点提示
+            prompts = points
+            gt_masks = gt_masks_points
+            prompt_type = "point"
+        else:  # 边界框提示
+            prompts = boxes
+            gt_masks = gt_masks_boxes
+            prompt_type = "box"
+
+        # 构建 batched_input
+        batched_input = []
+        for j in range(len(images)):
+            if prompt_type == "point":
+                batched_input.append({
+                    'image': images[j].to(device),
+                    'original_size': images[j].shape[1:],
+                    'point_coords': prompts[j].unsqueeze(1).to(device),
+                    'point_labels': torch.ones(prompts[j].shape[0], 1).to(device),
+                    'target': gt_masks[j].to(device),
+                })
+            elif prompt_type == "box":
+                batched_input.append({
+                    'image': images[j].to(device),
+                    'original_size': images[j].shape[1:],
+                    'boxes': prompts[j].to(device),
+                    'target': gt_masks[j].to(device),
+                })
 
         # 前向传播
         predictions = self(batched_input, multimask_output=False)
-        pred_masks = torch.stack([pred['masks'] for pred in predictions], dim=0)  # [B, N_points, H, W]
+        pred_masks = torch.stack([pred['masks'] for pred in predictions], dim=0)  # [B, N_prompts, H, W]
 
         # 计算损失
         dice_loss = self.mask_dice_loss(pred_masks, gt_masks)
@@ -230,6 +254,31 @@ class MyFastSAM(pl.LightningModule):
         self.log("train_total_loss", total_loss.item(), prog_bar=True)
 
         return total_loss
+
+    def iterative_training_step(self, batch):
+        images, gt_masks, points, _, _ = batch
+        device = self.device
+
+        predictions = []
+        for iteration in range(3):
+            if iteration == 0:
+                prompts = points
+            else:
+                # 从误差区域采样新点
+                error_region = (gt_masks - predictions[-1]).abs()
+                error_y, error_x = torch.where(error_region > 0)
+                idx = torch.randint(0, len(error_y), (1,)).item()
+                prompts = torch.tensor([[error_x[idx], error_y[idx]]], dtype=torch.float32).unsqueeze(1)
+
+            batched_input = [{
+                'image': images[j].to(device),
+                'point_coords': prompts.to(device),
+                'point_labels': torch.ones(prompts.shape[0], 1).to(device),
+                'mask_inputs': predictions[-1] if iteration > 0 else None,
+            } for j in range(len(images))]
+
+            pred = self(batched_input, multimask_output=False)
+            predictions.append(pred)
 
     def validation_step(self, batch, batch_idx):
         images, targets = batch
@@ -316,68 +365,40 @@ def print_params(model):
     params = sum([np.prod(p.size()) for p in model_parameters])
     print("training params: ", params)
 
-def visualize_batch(images, pred, target, bbox):
+def visualize_batch(images, pred, target_points, target_boxes, gt_masks_points, gt_masks_boxes):
     def show_mask(mask, ax, random_color=False):
-        if random_color:
-            color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-        else:
-            color = np.array([30/255, 144/255, 255/255, 0.6])
-        h, w = mask.shape[-2:]
-        mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-        ax.imshow(mask_image)
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-    from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-    import numpy as np
+        color = np.random.random(3) if random_color else np.array([30/255, 144/255, 255/255])
+        ax.imshow(mask, alpha=0.6, cmap='cool')
+
+    def show_box(box, ax):
+        x1, y1, x2, y2 = box
+        rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1, edgecolor='green', linewidth=2, facecolor='none')
+        ax.add_patch(rect)
 
     batch_size = images.shape[0]
-    fig, axes = plt.subplots(batch_size, 3, figsize=(15, 5 * batch_size))  # 3 columns: image+GT, image+pred, image+bbox
+    fig, axes = plt.subplots(batch_size, 3, figsize=(15, 5 * batch_size))  # 3 columns
 
     for i in range(batch_size):
-        # Plot image + ground truth
-        ax_gt = axes[i, 0] if batch_size > 1 else axes[0]
-        ax_gt.imshow(images[i].permute(1, 2, 0).cpu().numpy())  # Assuming images are [C, H, W]
-        ax_gt.set_title(f"Image + GT (Sample {i})")
-        for mask in target[i]:
-            show_mask(mask.cpu().numpy(), ax_gt)
-        # ax_gt.axis('off')
+        # Image + Point Masks
+        axes[i, 0].imshow(images[i].permute(1, 2, 0).cpu().numpy())
+        for mask in gt_masks_points[i]:
+            show_mask(mask.cpu().numpy(), axes[i, 0])
+        axes[i, 0].set_title("GT Point Masks")
 
-        # Plot image + prediction
-        ax_pred = axes[i, 1] if batch_size > 1 else axes[1]
-        ax_pred.imshow(images[i].permute(1, 2, 0).cpu().numpy())
-        ax_pred.set_title(f"Image + Pred (Sample {i})")
-        for mask in pred[i]:
-            show_mask(mask.cpu().numpy(), ax_pred)
-        # ax_pred.axis('off')
+        # Image + Box Masks
+        axes[i, 1].imshow(images[i].permute(1, 2, 0).cpu().numpy())
+        for mask in gt_masks_boxes[i]:
+            show_mask(mask.cpu().numpy(), axes[i, 1])
+        axes[i, 1].set_title("GT Box Masks")
 
-        # Plot image + bounding boxes
-        ax_bbox = axes[i, 2] if batch_size > 1 else axes[2]
-        ax_bbox.imshow(images[i].permute(1, 2, 0).cpu().numpy())
-        ax_bbox.set_title(f"Image + Prompt (Sample {i})")
-        for box in bbox[i]:
-            if box.shape[0]==4:
-                x1, y1, x2, y2 = box.cpu().numpy()
-                width, height = x2 - x1, y2 - y1
-                rect = patches.Rectangle((x1, y1), width, height, linewidth=2, edgecolor='green', facecolor='none')
-                ax_bbox.add_patch(rect)
-            if box.shape[0]==1:
-                x1, y1 = box.cpu().numpy()[0]
-                ax_bbox.plot(x1,y1,'go')
-        # ax_bbox.axis('off')
+        # Image + Bounding Boxes
+        axes[i, 2].imshow(images[i].permute(1, 2, 0).cpu().numpy())
+        for box in target_boxes[i]:
+            show_box(box.cpu().numpy(), axes[i, 2])
+        axes[i, 2].set_title("Bounding Boxes")
 
     plt.tight_layout()
-
-    # Convert the Matplotlib figure to a NumPy array
-    canvas = FigureCanvas(fig)
-    canvas.draw()
-    array = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
-    array = array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-
-    plt.close(fig)  # Close the figure to free memory
-    return array
-
-
-
+    plt.show()
 
 from tensorboardX import SummaryWriter
 import argparse
