@@ -23,63 +23,6 @@ target_transforms = transforms.Compose([
     transforms.Resize((160, 256)),
 ])
 
-def construct_input(batch):
-        image, target = batch # lists
-        def load_num_masks(target, NUM_MASK_PER_IMG):
-            num_masks = target.shape[0]
-            selected = []
-            if num_masks >= NUM_MASK_PER_IMG :
-                all_mask_index = np.arange(num_masks)
-                np.random.shuffle(all_mask_index)
-                select_mask_indices = all_mask_index[:NUM_MASK_PER_IMG]
-            else:
-                select_mask_indices = np.arange(num_masks)
-                for _ in range(NUM_MASK_PER_IMG-num_masks):
-                  select_mask_indices = np.append(select_mask_indices, select_mask_indices[-1])
-
-            # Select only 
-            for ind in select_mask_indices:
-                m = target[ind]
-                # decode masks from COCO RLE format
-                selected.append(m)
-
-            target = torch.stack(selected, dim=0)
-            return target
-
-        def get_bbox_from_target(target):
-            bbox = []
-            # pdb.set_trace()
-            for mask in target:
-                
-                mask_y, mask_x = torch.where(mask > 0)
-                x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
-                
-                center_x = (x1 + x2) / 2
-                center_y = (y1 + y2) / 2
-                w = (x2 - x1)
-                h = (y2 - y1)
-                delta_w = min(random.random() * 0.2 * w, 20)
-                delta_h = min(random.random() * 0.2 * h, 20)
-
-                x1, y1, x2, y2  = center_x - (w + delta_w) / 2, center_y - (h + delta_h) / 2, \
-                                    center_x + (w + delta_w) / 2, center_y + (h + delta_h) / 2
-                bbox.append(torch.tensor([x1, y1, x2, y2]))
-
-            bbox = torch.stack(bbox, dim=0)
-            return bbox
-        
-        image = torch.stack(image,dim=0)
-
-        new_target = [load_num_masks(tg,16) for tg in target]
-        new_target = torch.stack(new_target,dim=0)
-        
-        bbox = [get_bbox_from_target(tg) for tg in new_target]
-        bbox = torch.stack(bbox,dim=0)
-
-        assert bbox.shape[0] == image.shape[0]
-
-        return image, new_target, bbox
-
 from torch.utils.data import Dataset
 class SA1B_Dataset(Dataset):
     """A data loader for the SA-1B Dataset from "Segment Anything" (SAM)
@@ -123,6 +66,20 @@ class SA1B_Dataset(Dataset):
 input_reverse_transforms = transforms.Compose([
     transforms.ToPILImage(),
 ])
+
+class PKL_Dataset(Dataset):
+    def __init__(self, data_dir):
+        self.files = sorted(glob.glob(f"{data_dir}/*.pkl"))
+
+    def __getitem__(self, index):
+        # 加载预处理好的数据
+        image, gt_masks, points = joblib.load(self.files[index])
+        return torch.tensor(image, dtype=torch.float32), \
+            torch.tensor(gt_masks, dtype=torch.float32), \
+            torch.tensor(points, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.files)
 
 import matplotlib.pyplot as plt
 def show_image(image, target, row=12, col=12):
@@ -241,49 +198,38 @@ class MyFastSAM(pl.LightningModule):
 
     def training_step(self, batch):
         self.lora_sam.train()
-        images = batch[0]
-        # bbox = batch[2]
-        batched_input_bbox, batched_input_points = self.construct_batched_input(batch)
-         
-        batched_input = random.choice([batched_input_bbox, batched_input_points])
-        device = self.device
-        # 1a. single point prompt training
-        # 1b. iterative point prompt training up to 3 iteration
-        # 2. box prompt training, only 1 iteration
-        # self.optimizer.zero_grad()
-        predictions = self(batched_input, multimask_output = False
-        ) 
-        pred = [predictions[j]['masks'] for j in range(len(predictions))]
-        pred = torch.stack(pred, dim=0)
-        pred = pred.squeeze(2)
-        target = [batched_input[j]['target'] for j in range(len(batched_input))]
-        target = torch.stack(target, dim=0)
-        if 'boxes' in batched_input[0].keys():
-            prompt = [batched_input[j]['boxes'] for j in range(len(batched_input))]
-        if 'point_coords' in batched_input[0].keys() :
-            prompt = [batched_input[j]['point_coords'] for j in range(len(batched_input))]
-        prompt = torch.stack(prompt, dim=0)
 
-        score = [predictions[j]['iou_predictions'] for j in range(len(predictions))]
-        score = torch.stack(score, dim=0)
-        dl = self.mask_dice_loss(pred, target)
-        fl = self.mask_focal_loss(pred,target,0.25,2)
-        iou_loss, iou = self.iou_token_loss(score, pred, target)
-        loss = fl + 0.1*dl + iou_loss
-        loss.backward()
+        # 从 batch 中加载数据
+        images, gt_masks, points = batch  # 从 DataLoader 提供的数据中提取
+        device = self.device
+
+        batched_input = [{
+            'image': images[j].to(device),
+            'original_size': images[j].shape[1:],
+            'point_coords': points[j].unsqueeze(1).to(device),
+            'point_labels': torch.ones(points[j].shape[0], 1).to(device),  # 点提示标签
+            'target': gt_masks[j].to(device),  # ground truth 掩码
+        } for j in range(len(images))]
+
+        # 前向传播
+        predictions = self(batched_input, multimask_output=False)
+        pred_masks = torch.stack([pred['masks'] for pred in predictions], dim=0)  # [B, N_points, H, W]
+
+        # 计算损失
+        dice_loss = self.mask_dice_loss(pred_masks, gt_masks)
+        focal_loss = self.mask_focal_loss(pred_masks, gt_masks, alpha=0.25, gamma=2)
+        total_loss = dice_loss + focal_loss
+
+        # 反向传播
+        total_loss.backward()
         self.optimizer.step()
 
-        batch_prediction = {
-            'images':images.cpu(),
-            'target':target.cpu(),
-            'prompt':prompt.cpu(),
-            'pred':pred.detach().cpu(),
-        }
-        # self.log('train_loss', loss.item(), prog_bar=True)
+        # 记录损失
+        self.log("train_dice_loss", dice_loss.item(), prog_bar=True)
+        self.log("train_focal_loss", focal_loss.item(), prog_bar=True)
+        self.log("train_total_loss", total_loss.item(), prog_bar=True)
 
-        # During training, we backprop only the minimum loss over the 3 output masks.
-        # sam paper main text Section 3
-        return fl.item(), dl.item(), iou_loss.item(), torch.mean(iou).item(), batch_prediction
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
         images, targets = batch
@@ -465,8 +411,9 @@ print('[tensorboard] %s/%s/%s' % (args.result_dir, args.log_dir, start_time))
 save_dir = '%s/%s/%s' % (args.result_dir, args.log_dir, start_time)
 
 path = './train_data'
-SA1Bdataset = SA1B_Dataset(path)
-train_loader = DataLoader(SA1Bdataset,batch_size=16,shuffle=True)#,collate_fn=collate_fn)
+
+train_dataset = PKL_Dataset(path)
+train_loader = DataLoader(train_dataset,batch_size=16,shuffle=True)#,collate_fn=collate_fn)
 
 sam_downsampled = downsample_inject(sam)
 # pdb.set_trace()
