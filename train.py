@@ -144,7 +144,7 @@ class MyFastSAM(pl.LightningModule):
     def configure_optimizers(self):
         lora_parameters = [param for param in self.parameters() if param.requires_grad]
         # make sure original sam don't requires_grad
-        self.optimizer = torch.optim.AdamW(lora_parameters, lr=1e-5)
+        self.optimizer = torch.optim.AdamW(lora_parameters, lr=8e-5)
 
     @staticmethod
     def mask_dice_loss(prediction, targets):
@@ -161,6 +161,7 @@ class MyFastSAM(pl.LightningModule):
 
         pred_mask = torch.sigmoid(prediction)
         # pred_mask = prediction
+        # pdb.set_trace()
         fl_1 = -alpha * ( (1 - pred_mask[targets > .5]) ** gamma ) * \
             torch.log(pred_mask[targets > .5] + 1e-6)
         
@@ -213,25 +214,71 @@ class MyFastSAM(pl.LightningModule):
         score = [predictions[j]['iou_predictions'] for j in range(len(predictions))]
         score = torch.stack(score, dim=0)
         
+        # pred = pred[0]
+        # target = target[0]
+        all_fl = []
+        all_dl = []
+        all_loss = []
+        all_iou = []
+        all_pred = []
+        for j in range(pred.shape[1]): # querys
+            losses = []
+            fls = []
+            dls = []
+            ious = []
+            for k in range(pred[0,j].shape[0]):
+                multimask = pred[0,j,k]
+                
+                # for gt in target[0,j]:
+                gt = target[0,j]
+                dl = self.mask_dice_loss(multimask.unsqueeze(0), gt.unsqueeze(0))
+                fl = self.mask_focal_loss(multimask.unsqueeze(0), gt.unsqueeze(0), 0.25, 2)
+                iou_loss, iou = self.iou_token_loss(score[0,j,k].unsqueeze(0), multimask.unsqueeze(0), gt.unsqueeze(0))
+                loss = 10.*fl + dl + iou_loss
+                losses.append(loss)
+                fls.append(fl)
+                dls.append(dl)
+                ious.append(iou)
+
+                if torch.isnan(loss):
+                    pdb.set_trace()
+
+            losses = torch.stack(losses, dim=0)
+            chosen_loss = torch.argmin(losses)
+            # pdb.set_trace()
+            all_loss.append( losses[chosen_loss])
+            all_fl.append( fls[chosen_loss])
+            all_dl.append( dls[chosen_loss])
+            all_iou.append( ious[chosen_loss])
+            all_pred.append(pred[0,j,chosen_loss])
         # pdb.set_trace()
-        dl = self.mask_dice_loss(pred, target)
-        fl = self.mask_focal_loss(pred, target, 0.25, 2)
-        iou_loss, iou = self.iou_token_loss(score, pred, target)
-        loss = 20.*fl + dl + iou_loss
-        loss.backward()
+        all_loss = torch.mean(torch.stack(all_loss, dim=0))
+        all_fl = torch.mean(torch.stack(all_fl, dim=0))
+        all_dl = torch.mean(torch.stack(all_dl, dim=0))
+        all_iou = torch.mean(torch.stack(all_iou, dim=0))
+        all_pred = torch.stack(all_pred, dim=0).unsqueeze(0)
+        all_loss.backward()
+        # dl = self.mask_dice_loss(pred, target)
+        # fl = self.mask_focal_loss(pred, target, 0.25, 2)
+        # iou_loss, iou = self.iou_token_loss(score, pred, target)
+        # loss = 10.*all_fl + all_dl + iou_loss
+        
         self.optimizer.step()
+        iou_loss = torch.tensor([0])
+
+        # pdb.set_trace()
 
         batch_prediction = {
             'images':images.cpu(),
             'target':target.cpu(),
             'prompt':prompt.cpu(),
-            'pred':pred.detach().cpu(),
+            'pred':all_pred.detach().cpu(),
         }
         # self.log('train_loss', loss.item(), prog_bar=True)
 
         # During training, we backprop only the minimum loss over the 3 output masks.
         # sam paper main text Section 3
-        return fl.item(), dl.item(), iou_loss.item(), torch.mean(iou).item(), batch_prediction
+        return all_fl.item(), all_dl.item(), all_loss.item(), all_iou.item(), batch_prediction
 
     def validation_step(self, batch, batch_idx):
         images, targets = batch
@@ -326,8 +373,8 @@ def visualize_batch(images, pred, target, bbox):
         ax_gt = axes[i, 0] if batch_size > 1 else axes[0]
         ax_gt.imshow(images[i].permute(1, 2, 0).cpu().numpy())  # Assuming images are [C, H, W]
         ax_gt.set_title(f"Image + GT (Sample {i})")
-        for mask in target[i]:
-            for ms in mask:
+        for ms in target[i]:
+            # for ms in mask:
                 show_mask(ms.cpu().numpy(), ax_gt)
         # ax_gt.axis('off')
 
@@ -335,8 +382,8 @@ def visualize_batch(images, pred, target, bbox):
         ax_pred = axes[i, 1] if batch_size > 1 else axes[1]
         ax_pred.imshow(images[i].permute(1, 2, 0).cpu().numpy())
         ax_pred.set_title(f"Image + Pred (Sample {i})")
-        for mask in pred[i]:
-            for ms in mask:
+        for ms in pred[i]:
+            # for ms in mask:
                 show_mask(ms.cpu().numpy(), ax_pred)
         # ax_pred.axis('off')
 
@@ -406,7 +453,7 @@ save_dir = '%s/%s/%s' % (args.result_dir, args.log_dir, start_time)
 
 path = 'E:\data\lora_sam'
 SA1Bdataset = SA1B_Dataset(path)
-train_loader = DataLoader(SA1Bdataset,batch_size=8,shuffle=True)#,collate_fn=collate_fn)
+train_loader = DataLoader(SA1Bdataset,batch_size=1,shuffle=True)#,collate_fn=collate_fn)
 
 sam_downsampled = downsample_inject(sam)
 # pdb.set_trace()
@@ -425,7 +472,7 @@ if args.train:
             # visualize_batch(image, gt_masks_boxes, gt_masks_boxes, boxes)
             # pdb.set_trace()
             fl, dl, iou_loss, iou, batch = model.training_step(data)
-            if iter%200==0:
+            if iter%100==0:
 
                 writer.add_scalar('train/fl',fl,global_step=i*total_step+iter)
                 writer.add_scalar('train/dl',dl,global_step=i*total_step+iter)

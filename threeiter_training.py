@@ -181,11 +181,11 @@ class MyFastSAM(pl.LightningModule):
         pred = prediction>0
         
         iou = calculateIoU(pred, targets)
+        # pdb.set_trace()
+        return torch.nn.functional.mse_loss(iou_prediction,iou,reduction='sum'), iou
 
-        return torch.nn.functional.mse_loss(pred,iou,reduction='sum'), iou
 
-
-    def training_step(self, batch, logits = [], add_points, add_labels):
+    def training_step(self, batch, logits = [], add_points = None, add_labels = None):
         self.lora_sam.train()
         images = batch[0]
         
@@ -214,11 +214,12 @@ class MyFastSAM(pl.LightningModule):
         score = [predictions[j]['iou_predictions'] for j in range(len(predictions))]
         score = torch.stack(score, dim=0)
 
-        logits = [predictions[j]['low_res_logits'][torch.argmax(predictions[j]['iou_predictions'])].detach() for j in range(len(predictions))]
+        logits = [predictions[j]['low_res_logits'][:,torch.argmax(predictions[j]['iou_predictions'],dim=-1)].detach() for j in range(len(predictions))]
         
         # pdb.set_trace()
         dl = self.mask_dice_loss(pred, target)
         fl = self.mask_focal_loss(pred, target, 0.25, 2)
+        # pdb.set_trace()
         iou_loss, iou = self.iou_token_loss(score, pred, target)
         loss = 20.*fl + dl + iou_loss
         loss.backward()
@@ -252,7 +253,7 @@ class MyFastSAM(pl.LightningModule):
         # use same procedure as training, monitor the loss
         self.log('val_loss', loss, prog_bar=True)
 
-    def construct_batched_input(self, batch, logits = [], adp, adl):
+    def construct_batched_input(self, batch, logits = [], adp = None, adl=None):
         image, gt_masks_points, points, gt_masks_boxes, boxes = batch # Tensor
         device = self.device
 
@@ -262,7 +263,7 @@ class MyFastSAM(pl.LightningModule):
                 'original_size':(160, 256),
                 'point_coords':torch.cat([points[j].to(device).to(torch.float32).unsqueeze(1), adp[j].to(device).to(torch.float32).unsqueeze(1)], dim = 1),
                 'point_labels' : torch.cat([torch.ones(points[j].shape[0]).to(device).to(torch.int).unsqueeze(1),adl[j].to(device).to(torch.int).unsqueeze(1)],dim = 1),
-                'mask_inputs': logits[j].to(device).to(torch.float32)
+                'mask_inputs': logits[j].to(device).to(torch.float32),
                 'target': gt_masks_points[j].to(device)
             } for j in range(image.shape[0])] 
         else:
@@ -271,10 +272,10 @@ class MyFastSAM(pl.LightningModule):
                 'original_size':(160, 256),
                 'point_coords':points[j].to(device).to(torch.float32).unsqueeze(1),
                 'point_labels' : torch.ones(points[j].shape[0]).to(device).to(torch.int).unsqueeze(1),
-                'target': gt_masks_points[j].to(device)
+                'target': gt_masks_points[j].to(device),
             } for j in range(image.shape[0])] 
 
-        return batch_input, batch_input2
+        return None, batch_input2
 
 from segment_anything import sam_model_registry
 import torch
@@ -419,7 +420,7 @@ writer = SummaryWriter('%s/%s/%s' % (args.result_dir, args.log_dir, start_time))
 print('[tensorboard] %s/%s/%s' % (args.result_dir, args.log_dir, start_time))
 save_dir = '%s/%s/%s' % (args.result_dir, args.log_dir, start_time)
 
-path = './train_data_image_label'
+path = 'E:\data\lora_sam'
 SA1Bdataset = SA1B_Dataset(path)
 train_loader = DataLoader(SA1Bdataset,batch_size=1,shuffle=True)#,collate_fn=collate_fn)
 
