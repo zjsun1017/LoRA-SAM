@@ -216,13 +216,52 @@ class MyFastSAM(pl.LightningModule):
 
         logits = [predictions[j]['low_res_logits'][:,torch.argmax(predictions[j]['iou_predictions'],dim=-1)].detach() for j in range(len(predictions))]
         
+        all_fl = []
+        all_dl = []
+        all_loss = []
+        all_iou = []
+        all_pred = []
+        for j in range(pred.shape[1]): # querys
+            losses = []
+            fls = []
+            dls = []
+            ious = []
+            for k in range(pred[0,j].shape[0]):
+                multimask = pred[0,j,k]
+                
+                # for gt in target[0,j]:
+                gt = target[0,j]
+                dl = self.mask_dice_loss(multimask.unsqueeze(0), gt.unsqueeze(0))
+                fl = self.mask_focal_loss(multimask.unsqueeze(0), gt.unsqueeze(0), 0.25, 2)
+                iou_loss, iou = self.iou_token_loss(score[0,j,k].unsqueeze(0), multimask.unsqueeze(0), gt.unsqueeze(0))
+                loss = 10.*fl + dl + iou_loss
+                losses.append(loss)
+                fls.append(fl)
+                dls.append(dl)
+                ious.append(iou)
+
+                if torch.isnan(loss):
+                    pdb.set_trace()
+
+            losses = torch.stack(losses, dim=0)
+            chosen_loss = torch.argmin(losses)
+            # pdb.set_trace()
+            all_loss.append( losses[chosen_loss])
+            all_fl.append( fls[chosen_loss])
+            all_dl.append( dls[chosen_loss])
+            all_iou.append( ious[chosen_loss])
+            all_pred.append(pred[0,j,chosen_loss])
         # pdb.set_trace()
-        dl = self.mask_dice_loss(pred, target)
-        fl = self.mask_focal_loss(pred, target, 0.25, 2)
+        all_loss = torch.mean(torch.stack(all_loss, dim=0))
+        all_fl = torch.mean(torch.stack(all_fl, dim=0))
+        all_dl = torch.mean(torch.stack(all_dl, dim=0))
+        all_iou = torch.mean(torch.stack(all_iou, dim=0))
+        all_pred = torch.stack(all_pred, dim=0).unsqueeze(0)
+        all_loss.backward()
         # pdb.set_trace()
-        iou_loss, iou = self.iou_token_loss(score, pred, target)
-        loss = 20.*fl + dl + iou_loss
-        loss.backward()
+        # iou_loss, iou = self.iou_token_loss(score, pred, target)
+        # loss = 20.*fl + dl + iou_loss
+        # loss.backward()
         self.optimizer.step()
 
         add_points = []
@@ -238,13 +277,13 @@ class MyFastSAM(pl.LightningModule):
             'images':images.cpu(),
             'target':target.cpu(),
             'prompt':prompt.cpu(),
-            'pred':pred.detach().cpu(),
+            'pred':all_pred.detach().cpu(),
         }
         # self.log('train_loss', loss.item(), prog_bar=True)
 
         # During training, we backprop only the minimum loss over the 3 output masks.
         # sam paper main text Section 3
-        return fl.item(), dl.item(), iou_loss.item(), torch.mean(iou).item(), batch_prediction, logits, add_points, add_label
+        return fl.item(), dl.item(), iou_loss.item(), torch.mean(iou).item(), batch_prediction, all_pred.detach(), add_points, add_label
 
     def validation_step(self, batch, batch_idx):
         images, targets = batch
@@ -258,7 +297,8 @@ class MyFastSAM(pl.LightningModule):
         device = self.device
 
         if len(logits) != 0:
-            batch_input1 = [{
+            pdb.set_trace()
+            batch_input = [{
                 'image':image[j].to(device)*255,
                 'original_size':(160, 256),
                 'point_coords':torch.cat([points[j].to(device).to(torch.float32).unsqueeze(1), adp[j].to(device).to(torch.float32).unsqueeze(1)], dim = 1),
@@ -267,7 +307,7 @@ class MyFastSAM(pl.LightningModule):
                 'target': gt_masks_points[j].to(device)
             } for j in range(image.shape[0])] 
         else:
-            batch_input2 = [{
+            batch_input = [{
                 'image':image[j].to(device)*255,
                 'original_size':(160, 256),
                 'point_coords':points[j].to(device).to(torch.float32).unsqueeze(1),
@@ -275,7 +315,7 @@ class MyFastSAM(pl.LightningModule):
                 'target': gt_masks_points[j].to(device),
             } for j in range(image.shape[0])] 
 
-        return None, batch_input2
+        return None, batch_input
 
 from segment_anything import sam_model_registry
 import torch

@@ -100,6 +100,7 @@ class MyFastSAM(pl.LightningModule):
         self.lora_sam = orig_sam
         LoRA_injection(self.lora_sam,['linear','conv','convT'], lora_rank, lora_scale)
         self.configure_optimizers()
+        self.accum_iter = 64
         
 
     def forward(self, *args, **kwargs):
@@ -186,7 +187,7 @@ class MyFastSAM(pl.LightningModule):
         return torch.nn.functional.mse_loss(iou_prediction,iou,reduction='mean'), iou
 
 
-    def training_step(self, batch):
+    def training_step(self, batch, batch_idx):
         self.lora_sam.train()
         images = batch[0]
         # bbox = batch[2]
@@ -197,7 +198,7 @@ class MyFastSAM(pl.LightningModule):
         # 1a. single point prompt training
         # 1b. iterative point prompt training up to 3 iteration
         # 2. box prompt training, only 1 iteration
-        self.optimizer.zero_grad()
+        # self.optimizer.zero_grad()
         predictions = self(batched_input, multimask_output = True
         ) 
         pred = [predictions[j]['masks'] for j in range(len(predictions))]
@@ -252,7 +253,7 @@ class MyFastSAM(pl.LightningModule):
             all_iou.append( ious[chosen_loss])
             all_pred.append(pred[0,j,chosen_loss])
         # pdb.set_trace()
-        all_loss = torch.mean(torch.stack(all_loss, dim=0))
+        all_loss = torch.mean(torch.stack(all_loss, dim=0))/ self.accum_iter
         all_fl = torch.mean(torch.stack(all_fl, dim=0))
         all_dl = torch.mean(torch.stack(all_dl, dim=0))
         all_iou = torch.mean(torch.stack(all_iou, dim=0))
@@ -263,7 +264,13 @@ class MyFastSAM(pl.LightningModule):
         # iou_loss, iou = self.iou_token_loss(score, pred, target)
         # loss = 10.*all_fl + all_dl + iou_loss
         
-        self.optimizer.step()
+        # self.optimizer.step()
+
+        # weights update
+        if ((batch_idx + 1) % self.accum_iter == 0) or (batch_idx + 1 == len(data_loader)):
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
         iou_loss = torch.tensor([0])
 
         # pdb.set_trace()
