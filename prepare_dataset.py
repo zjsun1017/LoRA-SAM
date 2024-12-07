@@ -34,14 +34,21 @@ def construct_input(image, target):
         return torch.tensor(points, dtype=torch.float32)
 
     def get_random_boxes(target, num_boxes=16):
-        """生成 num_boxes 个加噪边界框"""
+        """生成 num_boxes 个加噪边界框，基于每个掩码的独立区域"""
         boxes = []
+        num_masks = target.shape[0]  # 获取掩码数量
+
         for _ in range(num_boxes):
-            # 聚合所有掩码的前景区域
-            mask_y, mask_x = torch.where(target.sum(dim=0) > 0)
+            # 随机选择一个掩码
+            mask_idx = torch.randint(0, num_masks, (1,)).item()
+            mask = target[mask_idx]
+
+            # 获取该掩码的前景区域
+            mask_y, mask_x = torch.where(mask > 0)
             if len(mask_y) == 0:
                 boxes.append([0, 0, 0, 0])  # 没有前景时返回空框
                 continue
+
             x1, y1, x2, y2 = mask_x.min(), mask_y.min(), mask_x.max(), mask_y.max()
             width, height = x2 - x1, y2 - y1
 
@@ -55,6 +62,7 @@ def construct_input(image, target):
                 min(target.shape[2], x2 + dx2), min(target.shape[1], y2 + dy2)
             ]
             boxes.append(noisy_box)
+
         return torch.tensor(boxes, dtype=torch.float32)
 
     def generate_gt_masks(target, prompts, num_masks=3, prompt_type="point"):
@@ -87,7 +95,6 @@ def construct_input(image, target):
     # 生成随机边界框
     boxes = get_random_boxes(target, num_boxes=16)
     gt_masks_boxes = generate_gt_masks(target, boxes, prompt_type="box")
-    print(gt_masks_points.shape)
 
     return image, gt_masks_points, points, gt_masks_boxes, boxes
 
