@@ -1,6 +1,7 @@
 .nfs*
 sa1b
 exp
+train_data
 
 # compilation and distribution
 __pycache__
