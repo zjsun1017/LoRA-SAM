@@ -274,9 +274,13 @@ class MyFastSAM(pl.LightningModule):
         error_region = target.to(torch.float32)-pred_hard.to(torch.float32)
 
         error_region = error_region.squeeze(0)
-        for er in error_region:
+        for idx in range(len(error_region)):
+            er = error_region[idx]
             # pdb.set_trace()
             mask_y, mask_x = torch.where(er != 0)
+            if mask_y.shape[0]==0:
+                tg = target.squeeze(0)[idx]
+                mask_y, mask_x = torch.where(tg != 0)
             selection = random.randint(0, mask_y.shape[0]-1)
             add_points.append(torch.tensor([mask_x[selection], mask_y[selection]]))
             add_label.append(torch.tensor([0 if er[mask_y[selection],mask_x[selection]]==-1 else 1]))
@@ -369,7 +373,7 @@ def print_params(model):
     params = sum([np.prod(p.size()) for p in model_parameters])
     print("training params: ", params)
 
-def visualize_batch(images, pred, target, bbox):
+def visualize_batch(images, pred, target, bbox, adl):
     def show_mask(mask, ax, random_color=False):
         if random_color:
             color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
@@ -409,8 +413,11 @@ def visualize_batch(images, pred, target, bbox):
         ax_bbox = axes[i, 2] if batch_size > 1 else axes[2]
         ax_bbox.imshow(images[i].permute(1, 2, 0).cpu().numpy())
         ax_bbox.set_title(f"Image + Prompt (Sample {i})")
-        for box in bbox[i]:
-            # for box in b:
+        for b in bbox[i]:
+            # pdb.set_trace()
+            for idx in range(len(b)):
+                box = b[idx]
+                label = adl[0,idx]
                 if box.shape[0]==4:
                     x1, y1, x2, y2 = box.cpu().numpy()
                     width, height = x2 - x1, y2 - y1
@@ -420,8 +427,13 @@ def visualize_batch(images, pred, target, bbox):
                     x1, y1 = box.cpu().numpy()[0]
                     ax_bbox.plot(x1,y1,'go')
                 if box.shape[0]==2:
-                    x1, y1 = box.cpu().numpy()
+                    x1, y1 = box.cpu().numpy()[0]
                     ax_bbox.plot(x1,y1,'go')
+                    x1, y1 = box.cpu().numpy()[1]
+                    if label==0:
+                        ax_bbox.plot(x1,y1,'bo')
+                    else:
+                        ax_bbox.plot(x1,y1,'ro')
         # ax_bbox.axis('off')
 
     plt.tight_layout()
@@ -469,7 +481,7 @@ writer = SummaryWriter('%s/%s/%s' % (args.result_dir, args.log_dir, start_time))
 print('[tensorboard] %s/%s/%s' % (args.result_dir, args.log_dir, start_time))
 save_dir = '%s/%s/%s' % (args.result_dir, args.log_dir, start_time)
 
-path = 'train_data'
+path = 'E:\data\lora_sam'
 SA1Bdataset = SA1B_Dataset(path)
 train_loader = DataLoader(SA1Bdataset,batch_size=1,shuffle=True)#,collate_fn=collate_fn)
 
@@ -491,9 +503,26 @@ if args.train:
             # pdb.set_trace()
 
             # Three iter training
+            focal_loss = 0
+            dice_loss = 0
+            all_iou = 0
+            all_loss = 0
+
             fl, dl, iou_loss, iou, batch1, logits, adp, adl = model.training_step(data)
+            focal_loss+=fl/3
+            dice_loss+=dl/3
+            all_iou+=iou/3
+            all_loss+=iou_loss/3
             fl, dl, iou_loss, iou, batch2, logits, adp, adl = model.training_step(data, logits, adp, adl)
+            focal_loss+=fl/3
+            dice_loss+=dl/3
+            all_iou+=iou/3
+            all_loss+=iou_loss/3
             fl, dl, iou_loss, iou, batch3, logits, adp, adl = model.training_step(data, logits, adp, adl)
+            focal_loss+=fl/3
+            dice_loss+=dl/3
+            all_iou+=iou/3
+            all_loss+=iou_loss/3
             # pdb.set_trace()
             img_vis = torch.cat([batch1['images'],batch2['images'],batch3['images']], dim = 0)
             pred_vis = torch.cat([batch1['pred'],batch2['pred'],batch3['pred']], dim = 0)
@@ -501,11 +530,11 @@ if args.train:
             prompt_vis = [batch1['prompt'],batch2['prompt'],batch3['prompt']]
             if iter%200==0:
 
-                writer.add_scalar('train/fl',fl,global_step=i*total_step+iter)
-                writer.add_scalar('train/dl',dl,global_step=i*total_step+iter)
-                writer.add_scalar('train/tl',iou_loss,global_step=i*total_step+iter)
-                writer.add_scalar('train/iou',iou,global_step=i*total_step+iter)
-                canvas = visualize_batch(img_vis, pred_vis, target_vis, prompt_vis)
+                writer.add_scalar('train/fl',focal_loss,global_step=i*total_step+iter)
+                writer.add_scalar('train/dl',dice_loss,global_step=i*total_step+iter)
+                writer.add_scalar('train/tl',all_loss,global_step=i*total_step+iter)
+                writer.add_scalar('train/iou',all_iou,global_step=i*total_step+iter)
+                canvas = visualize_batch(img_vis, pred_vis, target_vis, prompt_vis, adl)
                 writer.add_images('train/viz', canvas, i*total_step+iter, dataformats='HWC')
             #     writer.add_images('train/pred', pred, epoch*total_step+iter, dataformats='HWC')
             #     writer.add_images('train/gt', gt, epoch*total_step+iter, dataformats='HWC')
